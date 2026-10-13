@@ -22,7 +22,11 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include <dxgi1_2.h>
 #include "../steamvr/profile.h"
+#ifdef D2RVR_NATIVE_OPENXR
+#include "eye_size.h"
+#endif
 #include <tlhelp32.h>
 #include <intrin.h>
 #include <xinput.h>
@@ -4120,15 +4124,56 @@ void HookCursor() {
 // and panels on them) - but not while the chat line is open: then they are
 // letters, and every other key goes to the game anyway.
 #ifdef D2RVR_NATIVE_OPENXR
-// The headset copy is the swapchain, 1:1. The game builds its scene targets from
-// the monitor unless the window, client rect and display mode all say otherwise.
-struct EyeOuter { int w, h; };
-EyeOuter EyeOuterSize(HWND h, uint32_t ew, uint32_t eh) {
-    RECT r{0, 0, (LONG)ew, (LONG)eh};
-    const DWORD style = (DWORD)GetWindowLongW(h, GWL_STYLE);
-    const DWORD ex = (DWORD)GetWindowLongW(h, GWL_EXSTYLE);
-    if (!AdjustWindowRectEx(&r, style, GetMenu(h) != nullptr, ex)) return {(int)ew, (int)eh};
-    return {r.right - r.left, r.bottom - r.top};
+// The game lays menus, name tags and the mouse out on a 16:9 canvas. The
+// physical window is only a 16:9 view that fits on the monitor, and each eye
+// copies the canvas center at the SteamVR size.
+std::atomic<uint32_t> g_physClientW{0}, g_physClientH{0};
+using ScreenToClientFn = BOOL (WINAPI*)(HWND, LPPOINT);
+using ClientToScreenFn = BOOL (WINAPI*)(HWND, LPPOINT);
+using SystemParametersInfoWFn = BOOL (WINAPI*)(UINT, UINT, PVOID, UINT);
+using SetWindowPosFn = BOOL (WINAPI*)(HWND, HWND, int, int, int, int, UINT);
+ScreenToClientFn OrigScreenToClient = nullptr;
+ClientToScreenFn OrigClientToScreen = nullptr;
+SystemParametersInfoWFn OrigSystemParametersInfoW = nullptr;
+SetWindowPosFn OrigSetWindowPos = nullptr;
+bool LayoutSize(uint32_t* w, uint32_t* h) {
+    if (framevr::UiRenderSize(w, h)) return true;
+    return framevr::EyeRenderSize(w, h);
+}
+void FrameInsets(DWORD style, DWORD ex, bool menu, int& left, int& top, int& right, int& bottom) {
+    RECT r{0, 0, 160, 90};
+    if (!AdjustWindowRectEx(&r, style, menu, ex)) { left = top = right = bottom = 0; return; }
+    left = -r.left; top = -r.top; right = r.right - 160; bottom = r.bottom - 90;
+}
+bool PlaceGameWindow(DWORD style, DWORD ex, bool menu, RECT& outer) {
+    RECT work{};
+    if (!OrigSystemParametersInfoW || !OrigSystemParametersInfoW(SPI_GETWORKAREA, 0, &work, 0))
+        work = {0, 0, (LONG)g_monitorW, (LONG)g_monitorH};
+    int left = 0, top = 0, right = 0, bottom = 0;
+    FrameInsets(style, ex, menu, left, top, right, bottom);
+    const framevr::WindowFit fit = framevr::Fit16x9(work.left, work.top, work.right - work.left, work.bottom - work.top, left, top, right, bottom);
+    if (!fit.ok) return false;
+    g_physClientW.store((uint32_t)fit.w);
+    g_physClientH.store((uint32_t)fit.h);
+    outer.left = fit.x - left;
+    outer.top = fit.y - top;
+    outer.right = outer.left + left + fit.w + right;
+    outer.bottom = outer.top + top + fit.h + bottom;
+    return true;
+}
+bool ScaleToUi(POINT* p) {
+    uint32_t uw = 0, uh = 0, pw = g_physClientW.load(), ph = g_physClientH.load();
+    if (!p || !pw || !ph || !framevr::UiRenderSize(&uw, &uh) || (pw == uw && ph == uh)) return false;
+    p->x = framevr::MapSpan((int)p->x, (int)pw, (int)uw);
+    p->y = framevr::MapSpan((int)p->y, (int)ph, (int)uh);
+    return true;
+}
+bool ScaleToPhys(POINT* p) {
+    uint32_t uw = 0, uh = 0, pw = g_physClientW.load(), ph = g_physClientH.load();
+    if (!p || !pw || !ph || !framevr::UiRenderSize(&uw, &uh) || (pw == uw && ph == uh)) return false;
+    p->x = framevr::MapSpan((int)p->x, (int)uw, (int)pw);
+    p->y = framevr::MapSpan((int)p->y, (int)uh, (int)ph);
+    return true;
 }
 bool LooksLikeGameClient(int w, int h) {
     if (w < 800 || h < 600 || w > 16384 || h > 16384) return false;
@@ -4144,53 +4189,59 @@ void NoteGameWindow(HWND hwnd, int w, int h) {
         g_gameWnd = hwnd;
 }
 bool ApplyEyeClient(HWND h) {
-    uint32_t ew = 0, eh = 0;
-    if (!h || !IsWindow(h) || !OrigGetClientRect || !framevr::EyeRenderSize(&ew, &eh)) return false;
+    uint32_t uw = 0, uh = 0, ew = 0, eh = 0;
+    if (!h || !IsWindow(h) || !OrigGetClientRect || !OrigSetWindowPos || !LayoutSize(&uw, &uh)) return false;
+    framevr::EyeRenderSize(&ew, &eh);
+    const DWORD style = (DWORD)GetWindowLongW(h, GWL_STYLE);
+    const DWORD ex = (DWORD)GetWindowLongW(h, GWL_EXSTYLE);
+    RECT outer{};
+    if (!PlaceGameWindow(style, ex, GetMenu(h) != nullptr, outer)) return false;
+    const UINT wantW = g_physClientW.load(), wantH = g_physClientH.load();
     RECT client{};
     if (!OrigGetClientRect(h, &client)) return false;
-    if ((UINT)client.right == ew && (UINT)client.bottom == eh && client.left == 0 && client.top == 0) {
+    static uint32_t postedW = 0, postedH = 0;
+    if (uw != postedW || uh != postedH) {
+        postedW = uw; postedH = uh;
+        PostMessageW(h, WM_SIZE, SIZE_RESTORED, MAKELPARAM(uw, uh));
+    }
+    if ((UINT)client.right == wantW && (UINT)client.bottom == wantH && client.left == 0 && client.top == 0) {
         static uint32_t toldW = 0, toldH = 0;
-        if (toldW != ew || toldH != eh) {
-            toldW = ew; toldH = eh;
-            LogF("vrcam: game window client is the SteamVR eye %ux%u", ew, eh);
+        if (toldW != wantW || toldH != wantH) {
+            toldW = wantW; toldH = wantH;
+            LogF("vrcam: window client %ux%u fits the monitor; UI canvas %ux%u; eye %ux%u", wantW, wantH, uw, uh, ew, eh);
         }
         return true;
     }
-    const DWORD style = (DWORD)GetWindowLongW(h, GWL_STYLE);
     if (style & WS_MAXIMIZE) {
         SetWindowLongW(h, GWL_STYLE, style & ~WS_MAXIMIZE);
         ShowWindow(h, SW_RESTORE);
     }
-    const EyeOuter outer = EyeOuterSize(h, ew, eh);
-    static bool placed = false;
-    const UINT flags = SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED | (placed ? SWP_NOMOVE : 0);
-    SetWindowPos(h, nullptr, 0, 0, outer.w, outer.h, flags);
-    placed = true;
+    OrigSetWindowPos(h, nullptr, outer.left, outer.top, outer.right - outer.left, outer.bottom - outer.top, SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
     RECT after{};
     OrigGetClientRect(h, &after);
     static ULONGLONG nextLog = 0;
     static int misses = 0;
     static uint32_t missW = 0, missH = 0;
-    if (missW != ew || missH != eh) { missW = ew; missH = eh; misses = 0; }
+    if (missW != wantW || missH != wantH) { missW = wantW; missH = wantH; misses = 0; }
     const ULONGLONG now = GetTickCount64();
     if (now >= nextLog) {
         nextLog = now + 2000;
-        LogF("vrcam: game window client %ldx%ld -> %ldx%ld (SteamVR eye %ux%u)", client.right, client.bottom, after.right, after.bottom, ew, eh);
+        LogF("vrcam: window client %ldx%ld -> %ldx%ld (monitor fit %ux%u, UI canvas %ux%u)", client.right, client.bottom, after.right, after.bottom, wantW, wantH, uw, uh);
     }
-    if ((UINT)after.right == ew && (UINT)after.bottom == eh) return true;
-    // The client lie still makes the game allocate the eye size when the
-    // desktop refuses a window taller than the monitor.
+    if ((UINT)after.right == wantW && (UINT)after.bottom == wantH) return true;
     return ++misses > 40;
 }
 void ForceOuter(WINDOWPOS* wp, HWND h) {
-    if (!wp || (wp->flags & SWP_NOSIZE)) return;
-    uint32_t ew = 0, eh = 0;
-    if (h != g_gameWnd || !framevr::EyeRenderSize(&ew, &eh)) return;
-    const EyeOuter outer = EyeOuterSize(h, ew, eh);
-    wp->cx = outer.w; wp->cy = outer.h;
+    if (!wp || h != g_gameWnd) return;
+    const DWORD style = (DWORD)GetWindowLongW(h, GWL_STYLE);
+    const DWORD ex = (DWORD)GetWindowLongW(h, GWL_EXSTYLE);
+    RECT outer{};
+    if (!PlaceGameWindow(style, ex, GetMenu(h) != nullptr, outer)) return;
+    wp->flags &= ~(SWP_NOSIZE | SWP_NOMOVE);
+    wp->x = outer.left; wp->y = outer.top;
+    wp->cx = outer.right - outer.left; wp->cy = outer.bottom - outer.top;
 }
 using CreateWindowExWFn = HWND (WINAPI*)(DWORD, LPCWSTR, LPCWSTR, DWORD, int, int, int, int, HWND, HMENU, HINSTANCE, LPVOID);
-using SetWindowPosFn = BOOL (WINAPI*)(HWND, HWND, int, int, int, int, UINT);
 using MoveWindowFn = BOOL (WINAPI*)(HWND, int, int, int, int, BOOL);
 using GetSystemMetricsFn = int (WINAPI*)(int);
 using GetSystemMetricsForDpiFn = int (WINAPI*)(int, UINT);
@@ -4198,11 +4249,9 @@ using EnumDisplaySettingsWFn = BOOL (WINAPI*)(LPCWSTR, DWORD, DEVMODEW*);
 using EnumDisplaySettingsExWFn = BOOL (WINAPI*)(LPCWSTR, DWORD, DEVMODEW*, DWORD);
 using ChangeDisplaySettingsWFn = LONG (WINAPI*)(DEVMODEW*, DWORD);
 using ChangeDisplaySettingsExWFn = LONG (WINAPI*)(LPCWSTR, DEVMODEW*, HWND, DWORD, LPVOID);
-using SystemParametersInfoWFn = BOOL (WINAPI*)(UINT, UINT, PVOID, UINT);
 using ShowWindowFn = BOOL (WINAPI*)(HWND, int);
 using SetWindowPlacementFn = BOOL (WINAPI*)(HWND, const WINDOWPLACEMENT*);
 CreateWindowExWFn OrigCreateWindowExW = nullptr;
-SetWindowPosFn OrigSetWindowPos = nullptr;
 MoveWindowFn OrigMoveWindow = nullptr;
 GetSystemMetricsFn OrigGetSystemMetrics = nullptr;
 GetSystemMetricsForDpiFn OrigGetSystemMetricsForDpi = nullptr;
@@ -4210,19 +4259,18 @@ EnumDisplaySettingsWFn OrigEnumDisplaySettingsW = nullptr;
 EnumDisplaySettingsExWFn OrigEnumDisplaySettingsExW = nullptr;
 ChangeDisplaySettingsWFn OrigChangeDisplaySettingsW = nullptr;
 ChangeDisplaySettingsExWFn OrigChangeDisplaySettingsExW = nullptr;
-SystemParametersInfoWFn OrigSystemParametersInfoW = nullptr;
 ShowWindowFn OrigShowWindow = nullptr;
 SetWindowPlacementFn OrigSetWindowPlacement = nullptr;
 int EyeMetric(int n, int real) {
     uint32_t ew = 0, eh = 0;
-    if (!framevr::EyeRenderSize(&ew, &eh)) return real;
+    if (!LayoutSize(&ew, &eh)) return real;
     if (n == SM_CXSCREEN || n == SM_CXFULLSCREEN) return (int)ew;
     if (n == SM_CYSCREEN || n == SM_CYFULLSCREEN) return (int)eh;
     return real;
 }
 void PatchDisplayMode(DEVMODEW* dm) {
     uint32_t ew = 0, eh = 0;
-    if (!dm || !g_monitorW || !g_monitorH || !framevr::EyeRenderSize(&ew, &eh)) return;
+    if (!dm || !g_monitorW || !g_monitorH || !LayoutSize(&ew, &eh)) return;
     const uint64_t pixels = (uint64_t)dm->dmPelsWidth * dm->dmPelsHeight;
     const uint64_t monitorPixels = (uint64_t)g_monitorW * g_monitorH;
     const bool native = dm->dmPelsWidth == g_monitorW && dm->dmPelsHeight == g_monitorH;
@@ -4234,19 +4282,18 @@ bool BlockDisplayChange() {
     uint32_t ew = 0, eh = 0;
     if (!framevr::EyeRenderSize(&ew, &eh)) return false;
     static bool told = false;
-    if (!told) { told = true; Log("vrcam: kept the desktop display mode; the game renders at the SteamVR eye size"); }
+    if (!told) { told = true; Log("vrcam: kept the desktop display mode; the interface is the 16:9 canvas"); }
     return true;
 }
 HWND WINAPI HookCreateWindowExW(DWORD ex, LPCWSTR cls, LPCWSTR title, DWORD style, int x, int y, int w, int h, HWND parent, HMENU menu, HINSTANCE inst, LPVOID param) {
-    uint32_t ew = 0, eh = 0;
     const bool top = parent == nullptr;
-    const bool preset = top && LooksLikeGameClient(w, h) && framevr::EyeRenderSize(&ew, &eh);
+    const bool preset = top && LooksLikeGameClient(w, h) && LayoutSize(nullptr, nullptr);
     if (preset) {
-        RECT r{0, 0, (LONG)ew, (LONG)eh};
-        if (AdjustWindowRectEx(&r, style, menu != nullptr, ex)) { w = r.right - r.left; h = r.bottom - r.top; }
-        else { w = (int)ew; h = (int)eh; }
+        RECT outer{};
+        if (PlaceGameWindow(style, ex, menu != nullptr, outer)) {
+            x = outer.left; y = outer.top; w = outer.right - outer.left; h = outer.bottom - outer.top;
+        }
         style &= ~WS_MAXIMIZE;
-        x = 0; y = 0;
     }
     HWND hwnd = OrigCreateWindowExW(ex, cls, title, style, x, y, w, h, parent, menu, inst, param);
     if (!hwnd || !top || !OrigGetClientRect) return hwnd;
@@ -4257,21 +4304,24 @@ HWND WINAPI HookCreateWindowExW(DWORD ex, LPCWSTR cls, LPCWSTR title, DWORD styl
     return hwnd;
 }
 BOOL WINAPI HookSetWindowPos(HWND hwnd, HWND after, int x, int y, int cx, int cy, UINT flags) {
-    if (hwnd == g_gameWnd && !(flags & SWP_NOSIZE)) {
-        uint32_t ew = 0, eh = 0;
-        if (framevr::EyeRenderSize(&ew, &eh)) {
-            const EyeOuter outer = EyeOuterSize(hwnd, ew, eh);
-            cx = outer.w; cy = outer.h;
+    if (hwnd == g_gameWnd) {
+        const DWORD style = (DWORD)GetWindowLongW(hwnd, GWL_STYLE);
+        const DWORD ex = (DWORD)GetWindowLongW(hwnd, GWL_EXSTYLE);
+        RECT outer{};
+        if (PlaceGameWindow(style, ex, GetMenu(hwnd) != nullptr, outer)) {
+            x = outer.left; y = outer.top; cx = outer.right - outer.left; cy = outer.bottom - outer.top;
+            flags &= ~(SWP_NOSIZE | SWP_NOMOVE);
         }
     }
     return OrigSetWindowPos(hwnd, after, x, y, cx, cy, flags);
 }
 BOOL WINAPI HookMoveWindow(HWND hwnd, int x, int y, int w, int h, BOOL repaint) {
     if (hwnd == g_gameWnd) {
-        uint32_t ew = 0, eh = 0;
-        if (framevr::EyeRenderSize(&ew, &eh)) {
-            const EyeOuter outer = EyeOuterSize(hwnd, ew, eh);
-            w = outer.w; h = outer.h;
+        const DWORD style = (DWORD)GetWindowLongW(hwnd, GWL_STYLE);
+        const DWORD ex = (DWORD)GetWindowLongW(hwnd, GWL_EXSTYLE);
+        RECT outer{};
+        if (PlaceGameWindow(style, ex, GetMenu(hwnd) != nullptr, outer)) {
+            x = outer.left; y = outer.top; w = outer.right - outer.left; h = outer.bottom - outer.top;
         }
     }
     return OrigMoveWindow(hwnd, x, y, w, h, repaint);
@@ -4280,9 +4330,19 @@ BOOL WINAPI HookGetClientRect(HWND hwnd, LPRECT r) {
     const BOOL ok = OrigGetClientRect(hwnd, r);
     if (!ok || !r || hwnd != g_gameWnd) return ok;
     uint32_t ew = 0, eh = 0;
-    if (!framevr::EyeRenderSize(&ew, &eh)) return ok;
+    if (!LayoutSize(&ew, &eh)) return ok;
     r->left = 0; r->top = 0; r->right = (LONG)ew; r->bottom = (LONG)eh;
     return ok;
+}
+BOOL WINAPI HookScreenToClient(HWND hwnd, LPPOINT p) {
+    const BOOL ok = OrigScreenToClient(hwnd, p);
+    if (!ok || hwnd != g_gameWnd) return ok;
+    ScaleToUi(p);
+    return ok;
+}
+BOOL WINAPI HookClientToScreen(HWND hwnd, LPPOINT p) {
+    if (hwnd == g_gameWnd) ScaleToPhys(p);
+    return OrigClientToScreen(hwnd, p);
 }
 int WINAPI HookGetSystemMetrics(int n) { return EyeMetric(n, OrigGetSystemMetrics(n)); }
 int WINAPI HookGetSystemMetricsForDpi(int n, UINT dpi) { return EyeMetric(n, OrigGetSystemMetricsForDpi(n, dpi)); }
@@ -4308,31 +4368,82 @@ BOOL WINAPI HookSystemParametersInfoW(UINT action, UINT param, PVOID out, UINT i
     const BOOL ok = OrigSystemParametersInfoW(action, param, out, ini);
     if (!ok || action != SPI_GETWORKAREA || !out) return ok;
     uint32_t ew = 0, eh = 0;
-    if (!framevr::EyeRenderSize(&ew, &eh)) return ok;
+    if (!LayoutSize(&ew, &eh)) return ok;
     RECT* r = (RECT*)out;
     r->left = 0; r->top = 0; r->right = (LONG)ew; r->bottom = (LONG)eh;
     return ok;
 }
 BOOL WINAPI HookShowWindow(HWND hwnd, int cmd) {
-    if (hwnd == g_gameWnd && (cmd == SW_MAXIMIZE || cmd == SW_SHOWMAXIMIZED) && framevr::EyeRenderSize(nullptr, nullptr))
+    if (hwnd == g_gameWnd && (cmd == SW_MAXIMIZE || cmd == SW_SHOWMAXIMIZED) && LayoutSize(nullptr, nullptr))
         cmd = SW_SHOWNORMAL;
     return OrigShowWindow(hwnd, cmd);
 }
 BOOL WINAPI HookSetWindowPlacement(HWND hwnd, const WINDOWPLACEMENT* in) {
     if (!in || hwnd != g_gameWnd) return OrigSetWindowPlacement(hwnd, in);
-    uint32_t ew = 0, eh = 0;
-    if (!framevr::EyeRenderSize(&ew, &eh)) return OrigSetWindowPlacement(hwnd, in);
+    if (!LayoutSize(nullptr, nullptr)) return OrigSetWindowPlacement(hwnd, in);
     WINDOWPLACEMENT p = *in;
     p.length = sizeof p;
     if (p.showCmd == SW_MAXIMIZE || p.showCmd == SW_SHOWMAXIMIZED) p.showCmd = SW_SHOWNORMAL;
-    const EyeOuter outer = EyeOuterSize(hwnd, ew, eh);
-    p.rcNormalPosition = {0, 0, outer.w, outer.h};
+    const DWORD style = (DWORD)GetWindowLongW(hwnd, GWL_STYLE);
+    const DWORD ex = (DWORD)GetWindowLongW(hwnd, GWL_EXSTYLE);
+    RECT outer{};
+    if (PlaceGameWindow(style, ex, GetMenu(hwnd) != nullptr, outer))
+        p.rcNormalPosition = outer;
     return OrigSetWindowPlacement(hwnd, &p);
+}
+using CreateSwapChainForHwndFn = HRESULT (STDMETHODCALLTYPE*)(IDXGIFactory2*, IUnknown*, HWND, const DXGI_SWAP_CHAIN_DESC1*, const DXGI_SWAP_CHAIN_FULLSCREEN_DESC*, IDXGIOutput*, IDXGISwapChain1**);
+CreateSwapChainForHwndFn OrigCreateSwapChainForHwnd = nullptr;
+HRESULT STDMETHODCALLTYPE HookCreateSwapChainForHwnd(IDXGIFactory2* factory, IUnknown* device, HWND hwnd, const DXGI_SWAP_CHAIN_DESC1* desc, const DXGI_SWAP_CHAIN_FULLSCREEN_DESC* fullscreen, IDXGIOutput* restrictOut, IDXGISwapChain1** out) {
+    DXGI_SWAP_CHAIN_DESC1 copy{};
+    const DXGI_SWAP_CHAIN_DESC1* use = desc;
+    // Flip-model NONE keeps a 1:1 corner of the canvas. The window is only the
+    // monitor-sized 16:9 view, so the present has to scale the whole interface.
+    if (desc && hwnd && desc->Width >= 640 && desc->Height >= 480 && desc->Scaling != DXGI_SCALING_STRETCH) {
+        copy = *desc;
+        copy.Scaling = DXGI_SCALING_STRETCH;
+        use = &copy;
+        static bool told = false;
+        if (!told) { told = true; Log("vrcam: the monitor window scales the full 16:9 interface"); }
+    }
+    return OrigCreateSwapChainForHwnd(factory, device, hwnd, use, fullscreen, restrictOut, out);
+}
+void InstallPresentationScale() {
+    // IDXGIFactory2::CreateSwapChainForHwnd is vtable slot 15 (IUnknown 3,
+    // IDXGIObject 4, IDXGIFactory 5, IDXGIFactory1 2, then IsWindowedStereoEnabled).
+    HMODULE dxgi = GetModuleHandleW(L"dxgi.dll");
+    if (!dxgi) dxgi = LoadLibraryW(L"dxgi.dll");
+    using CreateFactoryFn = HRESULT (WINAPI*)(UINT, REFIID, void**);
+    auto create = dxgi ? reinterpret_cast<CreateFactoryFn>(GetProcAddress(dxgi, "CreateDXGIFactory2")) : nullptr;
+    IDXGIFactory2* factory = nullptr;
+    if (!create || FAILED(create(0, IID_PPV_ARGS(&factory))) || !factory) {
+        Log("vrcam: presentation scaling hook skipped; no DXGI factory");
+        return;
+    }
+    void** vt = *reinterpret_cast<void***>(factory);
+    constexpr int slot = 15;
+    auto probe = reinterpret_cast<CreateSwapChainForHwndFn>(vt[slot]);
+    const HRESULT probed = probe ? probe(factory, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr) : E_FAIL;
+    if (probed != DXGI_ERROR_INVALID_CALL) {
+        factory->Release();
+        Log("vrcam: presentation scaling hook skipped; swapchain entry did not match");
+        return;
+    }
+    DWORD old = 0;
+    if (!VirtualProtect(&vt[slot], sizeof(void*), PAGE_READWRITE, &old)) {
+        factory->Release();
+        Log("vrcam: presentation scaling hook skipped; factory table is protected");
+        return;
+    }
+    OrigCreateSwapChainForHwnd = probe;
+    vt[slot] = reinterpret_cast<void*>(&HookCreateSwapChainForHwnd);
+    VirtualProtect(&vt[slot], sizeof(void*), old, &old);
+    factory->Release();
+    Log("vrcam: presentation scales a 16:9 interface into the monitor window");
 }
 void InstallEyeWindowHooks() {
     g_monitorW = (uint32_t)GetSystemMetrics(SM_CXSCREEN);
     g_monitorH = (uint32_t)GetSystemMetrics(SM_CYSCREEN);
-    LogF("vrcam: desktop is %ux%u; each eye renders at the SteamVR size", g_monitorW, g_monitorH);
+    LogF("vrcam: desktop is %ux%u; menus use a 16:9 canvas and each eye stays the SteamVR size", g_monitorW, g_monitorH);
     auto hook = [](const char* name, void* detour, void** orig) {
         void* fn = (void*)GetProcAddress(GetModuleHandleW(L"user32.dll"), name);
         const bool ok = fn && MH_CreateHook(fn, detour, orig) == MH_OK && MH_EnableHook(fn) == MH_OK;
@@ -4342,6 +4453,8 @@ void InstallEyeWindowHooks() {
     hook("SetWindowPos", (void*)&HookSetWindowPos, (void**)&OrigSetWindowPos);
     hook("MoveWindow", (void*)&HookMoveWindow, (void**)&OrigMoveWindow);
     hook("GetClientRect", (void*)&HookGetClientRect, (void**)&OrigGetClientRect);
+    hook("ScreenToClient", (void*)&HookScreenToClient, (void**)&OrigScreenToClient);
+    hook("ClientToScreen", (void*)&HookClientToScreen, (void**)&OrigClientToScreen);
     hook("GetSystemMetrics", (void*)&HookGetSystemMetrics, (void**)&OrigGetSystemMetrics);
     hook("GetSystemMetricsForDpi", (void*)&HookGetSystemMetricsForDpi, (void**)&OrigGetSystemMetricsForDpi);
     hook("EnumDisplaySettingsW", (void*)&HookEnumDisplaySettingsW, (void**)&OrigEnumDisplaySettingsW);
@@ -4351,6 +4464,7 @@ void InstallEyeWindowHooks() {
     hook("SystemParametersInfoW", (void*)&HookSystemParametersInfoW, (void**)&OrigSystemParametersInfoW);
     hook("ShowWindow", (void*)&HookShowWindow, (void**)&OrigShowWindow);
     hook("SetWindowPlacement", (void*)&HookSetWindowPlacement, (void**)&OrigSetWindowPlacement);
+    InstallPresentationScale();
 }
 #endif
 
@@ -4359,14 +4473,17 @@ LRESULT CALLBACK GameWndProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
     if(framevr::HandleWindowFocusMessage(h,msg,w,l))return 0;
     if (msg == WM_GETMINMAXINFO && l && g_gameWndProc) {
         const LRESULT r = CallWindowProcW(g_gameWndProc, h, msg, w, l);
-        uint32_t ew = 0, eh = 0;
-        if (h == g_gameWnd && framevr::EyeRenderSize(&ew, &eh)) {
+        if (h == g_gameWnd && LayoutSize(nullptr, nullptr)) {
             auto* m = (MINMAXINFO*)l;
-            const EyeOuter outer = EyeOuterSize(h, ew, eh);
-            if (m->ptMaxTrackSize.x < outer.w) m->ptMaxTrackSize.x = outer.w;
-            if (m->ptMaxTrackSize.y < outer.h) m->ptMaxTrackSize.y = outer.h;
-            if (m->ptMaxSize.x < outer.w) m->ptMaxSize.x = outer.w;
-            if (m->ptMaxSize.y < outer.h) m->ptMaxSize.y = outer.h;
+            const DWORD style = (DWORD)GetWindowLongW(h, GWL_STYLE);
+            const DWORD ex = (DWORD)GetWindowLongW(h, GWL_EXSTYLE);
+            RECT outer{};
+            if (PlaceGameWindow(style, ex, GetMenu(h) != nullptr, outer)) {
+                const int ow = outer.right - outer.left, oh = outer.bottom - outer.top;
+                m->ptMinTrackSize.x = m->ptMaxTrackSize.x = m->ptMaxSize.x = ow;
+                m->ptMinTrackSize.y = m->ptMaxTrackSize.y = m->ptMaxSize.y = oh;
+                m->ptMaxPosition.x = outer.left; m->ptMaxPosition.y = outer.top;
+            }
         }
         return r;
     }
@@ -4378,7 +4495,7 @@ LRESULT CALLBACK GameWndProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
     }
     if (msg == WM_SIZE && w != SIZE_MINIMIZED) {
         uint32_t ew = 0, eh = 0;
-        if (h == g_gameWnd && framevr::EyeRenderSize(&ew, &eh)) l = MAKELPARAM(ew, eh);
+        if (h == g_gameWnd && LayoutSize(&ew, &eh)) l = MAKELPARAM(ew, eh);
     }
 #endif
     // F1..F3 (F4 in VR) pick the view: the game, which has skills on them, never sees them.
@@ -4433,6 +4550,10 @@ LRESULT CALLBACK GameWndProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
             if (GetRawInputData((HRAWINPUT)l, RID_HEADER, &hdr, &size, sizeof(RAWINPUTHEADER)) != (UINT)-1 && hdr.dwType == RIM_TYPEMOUSE)
                 return DefWindowProcW(h, msg, w, l);
         }
+    }
+    if (msg >= WM_MOUSEFIRST && msg <= WM_MOUSELAST && msg != WM_MOUSEWHEEL && msg != WM_MOUSEHWHEEL) {
+        POINT p{(short)LOWORD(l), (short)HIWORD(l)};
+        if (ScaleToUi(&p)) l = MAKELPARAM((WORD)p.x, (WORD)p.y);
     }
     return CallWindowProcW(g_gameWndProc, h, msg, w, l);
 }

@@ -17,6 +17,8 @@ void ConfigureEyeTracking(bool enabled);
 // 0,0 uses the SteamVR recommended eye image. A pair is an explicit override.
 void ConfigureEyeRenderSize(uint32_t width, uint32_t height);
 bool EyeRenderSize(uint32_t* width, uint32_t* height);
+// 16:9 layout the game uses for menus, name tags and the mouse. 0 until an eye exists.
+bool UiRenderSize(uint32_t* width, uint32_t* height);
 bool DesktopRenderSize(uint32_t* width, uint32_t* height);
 bool QueryEyeTarget();
 void ConfigureGameplay(bool enabled);

@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <mutex>
@@ -23,6 +24,7 @@
 #include "pad_mirror_shared.h"
 #include "transport.h"
 #include "eye_size.h"
+#include "eye_compose.h"
 #include "../vr/bow.h"
 #include "../vr/melee.h"
 #include "frame_math.h"
@@ -194,8 +196,8 @@ HeightResetButton heightResetButton;
 MenuTriggerGate menuTriggerGate;
 PressEdge inventoryButton,menuButton;
 float lastRecenter=0;
-uint32_t width=0,height=0;
-DXGI_FORMAT format=DXGI_FORMAT_UNKNOWN;
+uint32_t width=0,height=0,frameW=0,frameH=0,menuW=0,menuH=0;
+DXGI_FORMAT format=DXGI_FORMAT_UNKNOWN,eyeColor=DXGI_FORMAT_UNKNOWN;
 reshade::api::swapchain* gameSwapchain=nullptr;
 ComPtr<ID3D12Device> device;
 ComPtr<ID3D12CommandQueue> queue;
@@ -215,12 +217,14 @@ struct Eye {
 std::array<Eye,2> eyes;
 Eye uiEye;
 Eye mapEye;
+Eye menuEye;
 bool mapSupported=false;
 constexpr uint32_t mapSide=512;
 std::atomic<bool> uiSupported{false};
 bool journalMode=false,spatialMode=false,workspacePlaced=false,opaqueMenuMode=false;
 UiBlit uiBlit;
 UiBlit mapBlit; // Own descriptors: native menu and map copies may share a frame.
+EyeCompose eyeCompose;
 potions::Models potionModels;
 potions::Scene potionScene;
 panels::MouseGate panelMouse;
@@ -424,7 +428,7 @@ void ClearInput() {
     if(pad.data) { const auto c=pad.data->counter;*pad.data={};pad.data->version=BW_PAD_MIRROR_VERSION;pad.data->writer_pid=GetCurrentProcessId();pad.data->reserved[0]=uint32_t(menus::Mode::Blocked);pad.data->reserved[1]=gamestate::MenuEpoch();pad.data->counter=c+1; }
     if(actions.data) { actions.data->held=0;++actions.data->counter; }
 }
-std::atomic<uint64_t> eyePacked{0}, recommendedPacked{0}, maxPacked{0}, overridePacked{0}, deskPacked{0};
+std::atomic<uint64_t> eyePacked{0}, uiPacked{0}, recommendedPacked{0}, maxPacked{0}, overridePacked{0}, deskPacked{0};
 std::atomic<uint32_t> eyeRetargets{0};
 bool eyeProbeTold=false;
 void RecomputeEye() {
@@ -434,6 +438,8 @@ void RecomputeEye() {
     UnpackSize(overridePacked.load(std::memory_order_acquire),overW,overH);
     const EyePixels chosen=ChooseEyePixels(recW,recH,maxW,maxH,overW,overH);
     const uint64_t next=PackSize(chosen.width,chosen.height);
+    const UiCanvas canvas=Canvas16x9(chosen.width,chosen.height);
+    uiPacked.store(PackSize(canvas.width,canvas.height),std::memory_order_release);
     const uint64_t prev=eyePacked.exchange(next,std::memory_order_acq_rel);
     if(prev==next)return;
     uint32_t prevW=0,prevH=0;UnpackSize(prev,prevW,prevH);
@@ -443,6 +449,11 @@ void RecomputeEye() {
         std::snprintf(line,sizeof line,"Frame OpenXR: eye target %ux%u from d2r_vr.ini (SteamVR recommended %ux%u%s)",chosen.width,chosen.height,recW,recH,chosen.clamped?"; clamped":"");
     else std::snprintf(line,sizeof line,"Frame OpenXR: SteamVR eye target %ux%u (recommended %ux%u, max %ux%u%s)",chosen.width,chosen.height,recW,recH,maxW,maxH,chosen.clamped?"; clamped":"");
     Say(line);
+    if(canvas.width){
+        char canvasLine[160];
+        std::snprintf(canvasLine,sizeof canvasLine,"Frame OpenXR: UI canvas %ux%u; eye rect at %u,%u",canvas.width,canvas.height,canvas.originX,canvas.originY);
+        Say(canvasLine);
+    }
 }
 void StoreRecommended(uint32_t width,uint32_t height,uint32_t maxW,uint32_t maxH) {
     recommendedPacked.store(PackSize(width,height),std::memory_order_release);
@@ -546,6 +557,11 @@ bool LoadEye(uint32_t* width,uint32_t* height) {
     if(!w||!h)return false;
     if(width)*width=w;if(height)*height=h;return true;
 }
+bool LoadUi(uint32_t* width,uint32_t* height) {
+    uint32_t w=0,h=0;UnpackSize(uiPacked.load(std::memory_order_acquire),w,h);
+    if(!w||!h)return false;
+    if(width)*width=w;if(height)*height=h;return true;
+}
 bool LoadDesk(uint32_t* width,uint32_t* height) {
     uint32_t w=0,h=0;UnpackSize(deskPacked.load(std::memory_order_acquire),w,h);
     if(!w||!h)return false;
@@ -620,18 +636,19 @@ void OnEyeScissors(reshade::api::command_list* cl,uint32_t first,uint32_t count,
     ApplyEyeScissor(cl);
 }
 bool OnCreateSwapchain(reshade::api::device_api,reshade::api::swapchain_desc& desc,void* hwnd) {
-    uint32_t ew=0,eh=0;
-    if(!LoadEye(&ew,&eh))return false;
+    uint32_t cw=0,ch=0,ew=0,eh=0;
+    if(!LoadUi(&cw,&ch))return false;
+    LoadEye(&ew,&eh);
     const uint32_t rw=desc.back_buffer.texture.width,rh=desc.back_buffer.texture.height;
     if(!IsScreenSwapchain(rw,rh,hwnd!=nullptr))return false;
     bool changed=false;
     if(desc.fullscreen_state){desc.fullscreen_state=false;changed=true;}
-    if(rw!=ew||rh!=eh) {
+    if(rw!=cw||rh!=ch) {
         if(!deskPacked.load(std::memory_order_acquire))deskPacked.store(PackSize(rw,rh),std::memory_order_release);
-        desc.back_buffer.texture.width=ew;desc.back_buffer.texture.height=eh;changed=true;
+        desc.back_buffer.texture.width=cw;desc.back_buffer.texture.height=ch;changed=true;
         static uint64_t lastLogged=0;
-        const uint64_t key=PackSize(rw,rh)^(PackSize(ew,eh)<<1);
-        if(lastLogged!=key){lastLogged=key;char line[160];std::snprintf(line,sizeof line,"Frame OpenXR: swapchain %ux%u -> SteamVR eye %ux%u",rw,rh,ew,eh);Say(line);}
+        const uint64_t key=PackSize(rw,rh)^(PackSize(cw,ch)<<1);
+        if(lastLogged!=key){lastLogged=key;char line[180];std::snprintf(line,sizeof line,"Frame OpenXR: swapchain %ux%u -> 16:9 UI %ux%u (eye %ux%u)",rw,rh,cw,ch,ew,eh);Say(line);}
     }
     return changed;
 }
@@ -911,8 +928,11 @@ bool Initialize(reshade::api::command_queue* rq,reshade::api::swapchain* swap) {
     sci.referenceSpaceType=XR_REFERENCE_SPACE_TYPE_VIEW;
     if(!Check(pCreateReferenceSpace(session,&sci,&headSpace),"create head space")||!SetupActions()) return false;
     auto* buffer=reinterpret_cast<ID3D12Resource*>(swap->get_current_back_buffer().handle);
-    const auto desc=buffer->GetDesc();width=uint32_t(desc.Width);height=desc.Height;format=desc.Format;
-    foveation::Initialize(device.Get(),queue.Get(),width,height);
+    const auto desc=buffer->GetDesc();frameW=uint32_t(desc.Width);frameH=desc.Height;format=desc.Format;
+    uint32_t eyeW=0,eyeH=0;
+    if(!LoadEye(&eyeW,&eyeH)){eyeW=frameW;eyeH=frameH;}
+    width=eyeW;height=eyeH;
+    foveation::Initialize(device.Get(),queue.Get(),frameW,frameH);
     uint32_t n=0;pEnumerateSwapchainFormats(session,0,&n,nullptr);
     std::vector<int64_t> formats(n);
     if(!Check(pEnumerateSwapchainFormats(session,n,&n,formats.data()),"enumerate formats")) return false;
@@ -922,8 +942,10 @@ bool Initialize(reshade::api::command_queue* rq,reshade::api::swapchain* swap) {
         for(auto f:formats)message+=" "+std::to_string(f);
         Say(message.c_str());return false;
     }
+    eyeColor=eyeFormat;
     {char message[128];std::snprintf(message,sizeof message,"Frame OpenXR: game format %d, eye format %d",int(format),int(eyeFormat));Say(message);}
     uiSupported=std::find(formats.begin(),formats.end(),int64_t(DXGI_FORMAT_R16G16B16A16_FLOAT))!=formats.end()&&uiBlit.Initialize(device.Get(),&Say);
+    eyeCompose.Initialize(device.Get(),eyeFormat,&Say);
     mapSupported=std::find(formats.begin(),formats.end(),int64_t(DXGI_FORMAT_R16G16B16A16_FLOAT))!=formats.end()&&mapBlit.Initialize(device.Get(),&Say);
     for(auto& e:eyes) {
         XrSwapchainCreateInfo c{XR_TYPE_SWAPCHAIN_CREATE_INFO};c.usageFlags=XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT|XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT;
@@ -946,8 +968,10 @@ bool Initialize(reshade::api::command_queue* rq,reshade::api::swapchain* swap) {
     tracking.data->version=D2RVR_SHARED_VERSION;pad.data->version=BW_PAD_MIRROR_VERSION;actions.data->version=D2RVR_ACTIONS_VERSION;
     gameSwapchain=swap;
     uint32_t targetW=0,targetH=0;const bool haveTarget=LoadEye(&targetW,&targetH);
-    char b[220];std::snprintf(b,sizeof b,"Frame OpenXR: D3D12 session ready, eyes %ux%u format %d (game format %d), SteamVR target %ux%u",width,height,int(eyeFormat),int(format),targetW,targetH);Say(b);
-    if(haveTarget&&(width!=targetW||height!=targetH))Say("Frame OpenXR: backbuffer is not the SteamVR eye yet; the game window is being resized to it");
+    char b[260];std::snprintf(b,sizeof b,"Frame OpenXR: D3D12 session ready, eyes %ux%u, UI %ux%u, format %d (game format %d), SteamVR target %ux%u",width,height,frameW,frameH,int(eyeFormat),int(format),targetW,targetH);Say(b);
+    const UiCanvas canvas=Canvas16x9(width,height);
+    if(canvas.width&&(frameW!=canvas.width||frameH!=canvas.height))Say("Frame OpenXR: backbuffer is not the 16:9 UI canvas yet");
+    else if(haveTarget&&!canvas.width&&(width!=targetW||height!=targetH))Say("Frame OpenXR: backbuffer is not the SteamVR eye yet; the game window is being resized to it");
     return true;
 }
 bool Bool(XrAction action,int hand) {
@@ -981,7 +1005,8 @@ void MenuPointer(const menus::Pad& controls) {
     const bool uiActive=panelMode||spatialReady;
     const auto surfacePose=spatialMode?uiPose:menuPose;
     const float surfaceWidth=spatialMode?uiSize:panelWidth;
-    const float surfaceHeight=spatialMode?uiSize*(uiCrop[2]>0?float(uiCrop[3])/uiCrop[2]:1.3f):panelWidth*height/width;
+    const float menuAspect=frameW&&frameH?float(frameH)/float(frameW):(width?float(height)/float(width):9.f/16.f);
+    const float surfaceHeight=spatialMode?uiSize*(uiCrop[2]>0?float(uiCrop[3])/uiCrop[2]:1.3f):panelWidth*menuAspect;
     const bool pressed=controls.rt>140;
     bool focused=gameWindow&&GetForegroundWindow()==gameWindow;
     if(uiActive&&menus::Busy(controls)&&!focused)focused=FocusGameForUi();
@@ -1631,10 +1656,11 @@ bool Begin() {
     const bool opaque=spatial&&gamestate::OpaqueMenuOpen();
     if(opaque!=opaqueMenuMode)Say(opaque?"Frame panels: shared black menu background":"Frame panels: spatial background restored");
     spatialMode=spatial;journalMode=book;opaqueMenuMode=opaque;uiEye.copied=false;
-    mapEye.copied=false;hud::MapFrame();
+    mapEye.copied=false;menuEye.copied=false;hud::MapFrame();
     hud::UiFrame(spatialMode,!journalMode,0);
     const bool panel=wantsPanel&&wantsPanel()&&!spatialMode;
     if(panel!=panelMode){ReleasePanelInput();panelMouse.Suspend();panelMode=panel;menuPlaced=false;Say(panel?"Frame OpenXR: flat menu panel active":"Frame OpenXR: stereo gameplay active");}
+    hud::CaptureOverlay(!panelMode);
     for(auto& e:eyes)e.copied=false;
     XrViewLocateInfo li{XR_TYPE_VIEW_LOCATE_INFO};li.viewConfigurationType=XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;li.displayTime=frameState.predictedDisplayTime;li.space=space;
     XrViewState vs{XR_TYPE_VIEW_STATE};uint32_t count=0;
@@ -1725,9 +1751,49 @@ bool Copy(ID3D12Resource* src,Eye& e,reshade::api::command_queue* rq) {
     barriers[0].Transition.pResource=src;barriers[0].Transition.StateBefore=D3D12_RESOURCE_STATE_PRESENT;barriers[0].Transition.StateAfter=D3D12_RESOURCE_STATE_COPY_SOURCE;
     barriers[1].Transition.pResource=dest;barriers[1].Transition.StateBefore=D3D12_RESOURCE_STATE_RENDER_TARGET;barriers[1].Transition.StateAfter=D3D12_RESOURCE_STATE_COPY_DEST;
     if(gpu)e.commands->EndQuery(gpuProfile.heap.Get(),D3D12_QUERY_TYPE_TIMESTAMP,eye*5+3);
-    e.commands->ResourceBarrier(2,barriers);e.commands->CopyResource(dest,src);
+    e.commands->ResourceBarrier(2,barriers);
+    const auto srcDesc=src->GetDesc();
+    const UiCanvas canvas=Canvas16x9(width,height);
+    const bool centerCrop=canvas.width==srcDesc.Width&&canvas.height==srcDesc.Height&&
+        canvas.originX+width<=canvas.width&&canvas.originY+height<=canvas.height&&
+        (canvas.width!=width||canvas.height!=height);
+    bool copied=false;
+    if(centerCrop) {
+        D3D12_BOX box{};box.left=canvas.originX;box.top=canvas.originY;box.front=0;box.right=canvas.originX+width;box.bottom=canvas.originY+height;box.back=1;
+        D3D12_TEXTURE_COPY_LOCATION from{},to{};
+        from.pResource=src;from.Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        to.pResource=dest;to.Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        e.commands->CopyTextureRegion(&to,0,0,0,&from,&box);copied=true;
+    } else if(srcDesc.Width==width&&srcDesc.Height==height) {
+        e.commands->CopyResource(dest,src);copied=true;
+    }
     for(auto& b:barriers)std::swap(b.Transition.StateBefore,b.Transition.StateAfter);
     e.commands->ResourceBarrier(2,barriers);
+    if(!copied){
+        e.commands->Close();
+        static bool told=false;
+        if(!told){told=true;Say("Frame OpenXR: eye copy skipped; the backbuffer does not contain the eye rect");}
+        return true;
+    }
+    if(centerCrop) {
+        uint32_t ow=0,oh=0;
+        auto* ui=reinterpret_cast<ID3D12Resource*>(hud::OverlayTexture(ow,oh));
+        if(ui&&ow==canvas.width&&oh==canvas.height) {
+            uint32_t barTop=0,barBottom=0;
+            hud::ToolbarBand(canvas.height,barTop,barBottom);
+            const OverlayRect rect{canvas.width,canvas.height,width,height,barTop,barBottom};
+            static bool overlayMiss=false,overlayOn=false;
+            if(eyeCompose.Render(device.Get(),e.commands.Get(),ui,dest,rect)) {
+                if(!overlayOn){overlayOn=true;Say("Frame OpenXR: toolbar is head-locked on the eye");}
+            } else if(!overlayMiss) {
+                overlayMiss=true;
+                char message[200];
+                std::snprintf(message,sizeof message,"Frame OpenXR: interface overlay skipped for this session (ui format %d, eye format %d, wanted %d)",
+                    int(ui->GetDesc().Format),int(dest->GetDesc().Format),int(eyeColor));
+                Say(message);
+            }
+        }
+    }
     if(!panelMode&&interactionInput.active&&potionModels.Ready()) {
         const auto& v=views[eye];
         potionModels.Render(e.commands.Get(),dest,eye,{V(v.pose.position),Q(v.pose.orientation)},
@@ -1812,6 +1878,47 @@ bool CopyUi(reshade::api::command_queue* rq) {
     if(FAILED(queue->Signal(fence.Get(),++fenceValue)))return false;
     e.copyFence=fenceValue;e.copied=true;std::copy_n(crop,4,uiCrop);return true;
 }
+bool CopyMenu(ID3D12Resource* src,reshade::api::command_queue* rq) {
+    if(menuEye.copied)return true;
+    const auto desc=src->GetDesc();
+    const uint32_t w=uint32_t(desc.Width),h=desc.Height;
+    if(!w||!h)return false;
+    if(menuEye.chain&&(menuW!=w||menuH!=h)) {
+        if(menuEye.acquired){XrSwapchainImageReleaseInfo ri{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};pReleaseSwapchainImage(menuEye.chain,&ri);menuEye.acquired=false;}
+        if(!WaitGpuValue(menuEye.copyFence))return false;
+        pDestroySwapchain(menuEye.chain);menuEye={};
+    }
+    auto& e=menuEye;
+    if(!e.chain) {
+        XrSwapchainCreateInfo c{XR_TYPE_SWAPCHAIN_CREATE_INFO};c.usageFlags=XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT|XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT;
+        const int64_t menuFormat=int64_t(eyeColor!=DXGI_FORMAT_UNKNOWN?eyeColor:format);
+        c.format=menuFormat;
+        c.width=w;c.height=h;c.sampleCount=c.faceCount=c.arraySize=c.mipCount=1;
+        if(!Check(pCreateSwapchain(session,&c,&e.chain),"create menu swapchain"))return false;
+        uint32_t n=0;pEnumerateSwapchainImages(e.chain,0,&n,nullptr);e.images.resize(n,{XR_TYPE_SWAPCHAIN_IMAGE_D3D12_KHR});
+        if(!Check(pEnumerateSwapchainImages(e.chain,n,&n,reinterpret_cast<XrSwapchainImageBaseHeader*>(e.images.data())),"enumerate menu textures"))return false;
+        if(!Hr(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,IID_PPV_ARGS(&e.allocator)),"create menu allocator")||
+           !Hr(device->CreateCommandList(0,D3D12_COMMAND_LIST_TYPE_DIRECT,e.allocator.Get(),nullptr,IID_PPV_ARGS(&e.commands)),"create menu list")||
+           !Hr(e.commands->Close(),"close initial menu list"))return false;
+        menuW=w;menuH=h;
+        char line[120];std::snprintf(line,sizeof line,"Frame OpenXR: 16:9 menu surface %ux%u",w,h);Say(line);
+    }
+    if(!Acquire(e)||!WaitGpuValue(e.copyFence))return false;
+    rq->flush_immediate_command_list();
+    if(!Hr(e.allocator->Reset(),"reset menu allocator")||!Hr(e.commands->Reset(e.allocator.Get(),nullptr),"reset menu list"))return false;
+    ID3D12Resource* dest=e.images[e.index].texture;
+    D3D12_RESOURCE_BARRIER barriers[2]{};
+    for(auto& b:barriers){b.Type=D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;b.Transition.Subresource=D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;}
+    barriers[0].Transition.pResource=src;barriers[0].Transition.StateBefore=D3D12_RESOURCE_STATE_PRESENT;barriers[0].Transition.StateAfter=D3D12_RESOURCE_STATE_COPY_SOURCE;
+    barriers[1].Transition.pResource=dest;barriers[1].Transition.StateBefore=D3D12_RESOURCE_STATE_RENDER_TARGET;barriers[1].Transition.StateAfter=D3D12_RESOURCE_STATE_COPY_DEST;
+    e.commands->ResourceBarrier(2,barriers);e.commands->CopyResource(dest,src);
+    for(auto& b:barriers)std::swap(b.Transition.StateBefore,b.Transition.StateAfter);
+    e.commands->ResourceBarrier(2,barriers);
+    if(!Hr(e.commands->Close(),"close menu list"))return false;
+    ID3D12CommandList* lists[]={e.commands.Get()};queue->ExecuteCommandLists(1,lists);
+    if(!Hr(queue->Signal(fence.Get(),++fenceValue),"signal menu fence"))return false;
+    e.copyFence=fenceValue;e.copied=true;return true;
+}
 void Capture(reshade::api::command_queue* rq,reshade::api::swapchain* swap) {
     std::lock_guard lock(mutex);
     if(failed)return;
@@ -1819,7 +1926,8 @@ void Capture(reshade::api::command_queue* rq,reshade::api::swapchain* swap) {
     if(swap!=gameSwapchain)return;
     auto* src=reinterpret_cast<ID3D12Resource*>(swap->get_current_back_buffer().handle);
     const auto desc=src->GetDesc();
-    if(desc.Width!=width||desc.Height!=height||desc.Format!=format) {
+    uint32_t targetW=0,targetH=0;const bool haveEye=LoadEye(&targetW,&targetH);
+    if(desc.Width!=frameW||desc.Height!=frameH||desc.Format!=format||(haveEye&&(targetW!=width||targetH!=height))) {
         Say("Frame OpenXR: window resized; recreating eye swapchains");Shutdown();failed=false;return;
     }
     if(!afr) {
@@ -1828,16 +1936,19 @@ void Capture(reshade::api::command_queue* rq,reshade::api::swapchain* swap) {
     }
     const bool stereo=afr&&afr->version==FLATVR_AFR_EYE_VERSION&&afr->enabled&&(!(wantsPanel&&wantsPanel())||SpatialMenu());
     if(!Begin()||!render||!valid) {if(!stereo)EndPair();return;}
-    const uint32_t eye=stereo?((afr->eye^afr->swap)&1u):0u;
-    if(eye==0&&!CopyMap(rq)) {mapSupported=false;mapEye.copied=false;Say("Frame menu map: copy unavailable; optional map suspended");}
-    if((eye==0&&!CopyUi(rq))||!Copy(src,eyes[eye],rq)){failed=true;EndPair();ClearInput();return;}
     if(!stereo) {
+        if(!CopyMenu(src,rq)){failed=true;EndPair();ClearInput();return;}
         if(!menuPlaced) {
             const auto pos=V(head.position)+math::Rotate(Q(head.orientation),{0,0,-1.6f});
             menuPose=head;menuPose.position={pos.x,pos.y,pos.z};menuPlaced=true;
         }
         EndPair();
-    } else if(!pairDrawing&&eyes[0].copied&&eyes[1].copied) {
+        return;
+    }
+    const uint32_t eye=(afr->eye^afr->swap)&1u;
+    if(eye==0&&!CopyMap(rq)) {mapSupported=false;mapEye.copied=false;Say("Frame menu map: copy unavailable; optional map suspended");}
+    if((eye==0&&!CopyUi(rq))||!Copy(src,eyes[eye],rq)){failed=true;EndPair();ClearInput();return;}
+    if(!pairDrawing&&eyes[0].copied&&eyes[1].copied) {
         EndPair();
     } else if(eye==1&&!eyes[0].copied) {
         // Missed left eye: submit zero layers, never present an old/mono image as stereo.
@@ -1908,6 +2019,7 @@ void ConfigureEyeRenderSize(uint32_t width,uint32_t height) {
     RecomputeEye();
 }
 bool EyeRenderSize(uint32_t* width,uint32_t* height) {return LoadEye(width,height);}
+bool UiRenderSize(uint32_t* width,uint32_t* height) {return LoadUi(width,height);}
 bool DesktopRenderSize(uint32_t* width,uint32_t* height) {return LoadDesk(width,height);}
 bool QueryEyeTarget() {return QueryEyeTargetImpl();}
 void BeginEye(int eye) {
@@ -1975,7 +2087,7 @@ void EndPair() {
     // WineOpenXR also drains that queue before its release/layout commands.
     // Keep the old path for A/B, and for synchronous diagnostic query readback.
     const bool waitNow=!deferredWait.load()||gpuProfile.started!=0;
-    if(waitNow&&fence&&!WaitGpu()){failed=true;for(auto& e:eyes)e.copied=false;}
+    if(waitNow&&fence&&!WaitGpu()){failed=true;for(auto& e:eyes)e.copied=false;menuEye.copied=false;}
     if(!failed)ReadGpuProfile();
     gpuProfile.started=gpuProfile.effects=gpuProfile.resolved=0;
     const double releaseStart=Milliseconds();
@@ -1988,6 +2100,8 @@ void EndPair() {
         Check(pReleaseSwapchainImage(uiEye.chain,&release),"release journal");uiEye.acquired=false;}
     if(mapEye.acquired){XrSwapchainImageReleaseInfo release{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
         if(!Check(pReleaseSwapchainImage(mapEye.chain,&release),"release menu map"))mapEye.copied=false;mapEye.acquired=false;}
+    if(menuEye.acquired){XrSwapchainImageReleaseInfo release{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+        if(!Check(pReleaseSwapchainImage(menuEye.chain,&release),"release menu"))menuEye.copied=false;menuEye.acquired=false;}
     timing.releaseMs=Milliseconds()-releaseStart;
     XrCompositionLayerProjection projection{XR_TYPE_COMPOSITION_LAYER_PROJECTION};
     std::array<XrCompositionLayerProjectionView,2> pv{{{XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW},{XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW}}};
@@ -1996,9 +2110,9 @@ void EndPair() {
     if(render&&valid&&!panelMode&&eyes[0].copied&&eyes[1].copied) {
         for(int i=0;i<2;++i){pv[i].pose=views[i].pose;pv[i].fov=views[i].fov;pv[i].subImage.swapchain=eyes[i].chain;pv[i].subImage.imageRect={{0,0},{int32_t(width),int32_t(height)}};}
         projection.space=space;projection.viewCount=2;projection.views=pv.data();layer=reinterpret_cast<const XrCompositionLayerBaseHeader*>(&projection);menuPlaced=false;
-    } else if(render&&valid&&eyes[0].copied&&menuPlaced) {
-        quad.space=space;quad.eyeVisibility=XR_EYE_VISIBILITY_BOTH;quad.pose=menuPose;quad.size={panelWidth,panelWidth*height/width};
-        quad.subImage.swapchain=eyes[0].chain;quad.subImage.imageRect={{0,0},{int32_t(width),int32_t(height)}};layer=reinterpret_cast<const XrCompositionLayerBaseHeader*>(&quad);
+    } else if(render&&valid&&menuEye.copied&&menuPlaced&&menuW&&menuH) {
+        quad.space=space;quad.eyeVisibility=XR_EYE_VISIBILITY_BOTH;quad.pose=menuPose;quad.size={panelWidth,panelWidth*float(menuH)/float(menuW)};
+        quad.subImage.swapchain=menuEye.chain;quad.subImage.imageRect={{0,0},{int32_t(menuW),int32_t(menuH)}};layer=reinterpret_cast<const XrCompositionLayerBaseHeader*>(&quad);
     }
     XrFrameEndInfo ei{XR_TYPE_FRAME_END_INFO};ei.displayTime=frameState.predictedDisplayTime;ei.environmentBlendMode=XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
     std::array<const XrCompositionLayerBaseHeader*,32> layers{};uint32_t count=0;
@@ -2332,6 +2446,15 @@ bool View(float out[16],const float hero[3],float eyeHeight,float userEyeHeight,
 bool Projection(float out[16],float nearWorld,int eye) {
     std::lock_guard lock(mutex);if(!Active())return false;
     const auto& f=views[eye&1].fov;
+    const UiCanvas canvas=Canvas16x9(width,height);
+    if(canvas.width>width&&canvas.height==height&&frameW==canvas.width&&frameH==canvas.height) {
+        const float l=std::tan(f.angleLeft),r=std::tan(f.angleRight);
+        const TanSpan wide=WidenHorizontal(l,r,width,canvas.width);
+        math::Projection(std::atan(wide.left),std::atan(wide.right),f.angleDown,f.angleUp,nearWorld,out);
+        static bool told=false;
+        if(!told){told=true;Say("Frame OpenXR: world frustum covers the 16:9 UI; the headset shows the center eye rect");}
+        return true;
+    }
     math::Projection(f.angleLeft,f.angleRight,f.angleDown,f.angleUp,nearWorld,out);return true;
 }
 void Shutdown() {
@@ -2341,8 +2464,9 @@ void Shutdown() {
     // Completion is mandatory before destroying our commands/resources, even
     // when ordinary frame submission uses queue ordering without a CPU wait.
     if(fence&&!WaitGpu())failed=true;
-    if(uiEye.chain&&pDestroySwapchain)pDestroySwapchain(uiEye.chain);uiEye={};journalMode=spatialMode=workspacePlaced=false;hud::UiFrame(false,false,0);uiSupported=false;uiBlit={};potionModels.Reset();potionScene={};
+    if(uiEye.chain&&pDestroySwapchain)pDestroySwapchain(uiEye.chain);uiEye={};journalMode=spatialMode=workspacePlaced=false;hud::UiFrame(false,false,0);hud::CaptureOverlay(false);uiSupported=false;uiBlit={};eyeCompose={};potionModels.Reset();potionScene={};
     if(mapEye.chain&&pDestroySwapchain)pDestroySwapchain(mapEye.chain);mapEye={};mapSupported=false;mapBlit={};gamestate::MenuMap(false);hud::MenuMapCapture(false);
+    if(menuEye.chain&&pDestroySwapchain)pDestroySwapchain(menuEye.chain);menuEye={};menuW=menuH=0;
     settingsModel.Close();settingsOpen=false;settingsInputGate.Suspend();settingsPaintRevision=~0ull;settingsAtlasPending=settingsImageReady=false;
     bodyCalibration.Cancel();calibrationRelease={};calibrationPrompted=floorSpace=false;calibrationSession=0;calibrationPaintKey=-1;
     if(settingsChain&&pDestroySwapchain)pDestroySwapchain(settingsChain);settingsChain=XR_NULL_HANDLE;

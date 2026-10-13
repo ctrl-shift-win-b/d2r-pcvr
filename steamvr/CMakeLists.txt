@@ -29,7 +29,7 @@ add_library(d2rl-vrcam SHARED ${ROOT}/vr/vrcam.cpp ${ROOT}/vr/dlss_mv.cpp ${ROOT
 target_sources(d2rl-vrcam PRIVATE ${ROOT}/vr/dlss_depth.cpp)
 target_sources(d2rl-vrcam PRIVATE ${ROOT}/vr/billboards.cpp)
 target_sources(d2rl-vrcam PRIVATE ${ROOT}/vr/panel_input.cpp)
-target_sources(d2rl-vrcam PRIVATE interaction_assets.rc interaction_icons.cpp ui_blit.cpp ui_world.cpp)
+target_sources(d2rl-vrcam PRIVATE interaction_assets.rc interaction_icons.cpp ui_blit.cpp eye_compose.cpp ui_world.cpp)
 target_sources(d2rl-vrcam PRIVATE potion_models.cpp)
 target_sources(d2rl-vrcam PRIVATE ${ROOT}/vr/settings_menu.cpp ${CMAKE_CURRENT_SOURCE_DIR}/vr_settings_ui.cpp ${ROOT}/vr/native_ui.cpp ${CMAKE_CURRENT_SOURCE_DIR}/interaction_ui.cpp ${ROOT}/vr/interactionstate.cpp ${ROOT}/vr/bow.cpp ${ROOT}/vr/projectiles.cpp ${ROOT}/vr/combat.cpp ${ROOT}/vr/melee.cpp ${CMAKE_CURRENT_SOURCE_DIR}/transport.cpp ${CMAKE_CURRENT_SOURCE_DIR}/foveation.cpp ${CMAKE_CURRENT_SOURCE_DIR}/logging.cpp ${CMAKE_CURRENT_SOURCE_DIR}/profile.cpp)
 target_include_directories(d2rl-vrcam PRIVATE ${ROOT}/shared ${ROOT}/external/flatvr ${ROOT}/external/bodywalk ${ROOT}/external/reshade/include ${CMAKE_CURRENT_SOURCE_DIR} ${OPENXR_SDK}/include)

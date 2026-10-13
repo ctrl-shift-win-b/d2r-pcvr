@@ -325,6 +325,7 @@ struct Labels { resource tex{}; resource_view srv{}; uint32_t w = 0, h = 0; bool
                 bool on = false; float keep[2][4] = {}; ULONGLONG at = 0; };
 Labels g_lab;
 std::atomic<bool> uiActive{false},workspaceActive{false};
+std::atomic<bool> g_eyeOverlay{false}, g_overlayReady{false};
 bool uiCaptured=false;
 std::atomic<int> uiEye{0};
 int32_t uiCrop[4]{};
@@ -456,6 +457,13 @@ void OnBind(command_list* cl, uint32_t count, const resource_view* rtvs, resourc
     auto it = g_drawing.find(cl);
     if (it != g_drawing.end() && it->second.layer.handle != now.handle) {
         const resource_view layerRtv = it->second.layer;
+#ifdef D2RVR_NATIVE_OPENXR
+        if (g_eyeOverlay.load()) {
+            const resource tex = dev->get_resource_from_view(layerRtv);
+            const resource_desc d = dev->get_resource_desc(tex);
+            if (CopyLayer(cl, tex, d.texture.width, d.texture.height)) g_overlayReady.store(true);
+        }
+#endif
         if(uiActive.load()) {
             const auto tex=dev->get_resource_from_view(layerRtv);const auto desc=dev->get_resource_desc(tex);
             int32_t native[4]{};
@@ -498,8 +506,13 @@ void OnBind(command_list* cl, uint32_t count, const resource_view* rtvs, resourc
         // From above: the rest of it out whole, for the effect to lay on the tilted plane.
         const bool labels = g_labels.load() && g_picReady.load() && !g_menu.load();
         const bool mask = !labels && g_uiMask.load() && g_picReady.load() && !g_menu.load();   // copied, left in
-        g_lab.on = (labels || mask) && CopyLayer(cl, dev->get_resource_from_view(layerRtv), it->second.w, it->second.h);
-        if (g_lab.on && labels) cl->clear_render_target_view(layerRtv, kEmpty);
+        // The eye overlay already owns this copy, taken before the toolbar clear.
+        // A second copy would replace it with the emptied bar.
+        if (g_eyeOverlay.load() && g_overlayReady.load()) g_lab.on = false;
+        else {
+            g_lab.on = (labels || mask) && CopyLayer(cl, dev->get_resource_from_view(layerRtv), it->second.w, it->second.h);
+            if (g_lab.on && labels) cl->clear_render_target_view(layerRtv, kEmpty);
+        }
         g_lab.at = GetTickCount64();
         g_drawing.erase(it);
     }
@@ -529,6 +542,7 @@ void Register() {
 void UiFrame(bool active,bool workspace,int eye){
     std::lock_guard lock(g_lock);
     if(!active||eye==0)uiCaptured=false;
+    g_overlayReady.store(false);
     uiActive=active;workspaceActive=workspace;uiEye=eye;
 #ifdef D2RVR_NATIVE_OPENXR
     framevr::uiworld::SetActive(active);
@@ -538,6 +552,19 @@ uint64_t UiTexture(uint32_t& width,uint32_t& height,int32_t crop[4]) {
     std::lock_guard lock(g_lock);
     if(!uiActive.load()||!uiCaptured||!g_lab.tex.handle)return 0;
     width=g_lab.w;height=g_lab.h;std::copy_n(uiCrop,4,crop);return g_lab.tex.handle;
+}
+void CaptureOverlay(bool on) { g_eyeOverlay.store(on); }
+uint64_t OverlayTexture(uint32_t& width,uint32_t& height) {
+    std::lock_guard lock(g_lock);
+    if(!g_overlayReady.load()||!g_lab.tex.handle)return 0;
+    width=g_lab.w;height=g_lab.h;return g_lab.tex.handle;
+}
+void ToolbarBand(uint32_t height, uint32_t& top, uint32_t& bottom) {
+    if (!height) { top = bottom = 0; return; }
+    const auto band = ToolbarRect(height, height);
+    top = band.top > 0 ? uint32_t(band.top) : 0;
+    bottom = band.bottom > int32_t(height) ? height : (band.bottom > 0 ? uint32_t(band.bottom) : 0);
+    if (top > bottom) top = bottom;
 }
 void MenuMapCapture(bool active) {g_menuMap.store(active);}
 void MapFrame() {std::lock_guard lock(g_lock);mapCaptured=false;}
