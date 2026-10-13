@@ -22,6 +22,7 @@
 #include "d2r_vr_shared.h"
 #include "pad_mirror_shared.h"
 #include "transport.h"
+#include "eye_size.h"
 #include "../vr/bow.h"
 #include "../vr/melee.h"
 #include "frame_math.h"
@@ -64,7 +65,7 @@ namespace {
 constexpr float kRadToDeg=57.295779513f;
 #define XR_FUNCTIONS(X) \
  X(EnumerateInstanceExtensionProperties) X(CreateInstance) X(DestroyInstance) \
- X(GetSystem) X(GetSystemProperties) X(GetInstanceProperties) X(GetD3D12GraphicsRequirementsKHR) \
+ X(GetSystem) X(EnumerateViewConfigurationViews) X(GetSystemProperties) X(GetInstanceProperties) X(GetD3D12GraphicsRequirementsKHR) \
  X(CreateSession) X(DestroySession) X(PollEvent) X(BeginSession) X(EndSession) \
  X(CreateReferenceSpace) X(DestroySpace) X(LocateSpace) X(LocateViews) \
  X(WaitFrame) X(BeginFrame) X(EndFrame) X(EnumerateSwapchainFormats) \
@@ -423,6 +424,217 @@ void ClearInput() {
     if(pad.data) { const auto c=pad.data->counter;*pad.data={};pad.data->version=BW_PAD_MIRROR_VERSION;pad.data->writer_pid=GetCurrentProcessId();pad.data->reserved[0]=uint32_t(menus::Mode::Blocked);pad.data->reserved[1]=gamestate::MenuEpoch();pad.data->counter=c+1; }
     if(actions.data) { actions.data->held=0;++actions.data->counter; }
 }
+std::atomic<uint64_t> eyePacked{0}, recommendedPacked{0}, maxPacked{0}, overridePacked{0}, deskPacked{0};
+std::atomic<uint32_t> eyeRetargets{0};
+bool eyeProbeTold=false;
+void RecomputeEye() {
+    uint32_t recW=0,recH=0,maxW=0,maxH=0,overW=0,overH=0;
+    UnpackSize(recommendedPacked.load(std::memory_order_acquire),recW,recH);
+    UnpackSize(maxPacked.load(std::memory_order_acquire),maxW,maxH);
+    UnpackSize(overridePacked.load(std::memory_order_acquire),overW,overH);
+    const EyePixels chosen=ChooseEyePixels(recW,recH,maxW,maxH,overW,overH);
+    const uint64_t next=PackSize(chosen.width,chosen.height);
+    const uint64_t prev=eyePacked.exchange(next,std::memory_order_acq_rel);
+    if(prev==next)return;
+    uint32_t prevW=0,prevH=0;UnpackSize(prev,prevW,prevH);
+    char line[240];
+    if(!chosen.width)std::snprintf(line,sizeof line,"Frame OpenXR: SteamVR eye target cleared (was %ux%u)",prevW,prevH);
+    else if(overW>=640&&overH>=480)
+        std::snprintf(line,sizeof line,"Frame OpenXR: eye target %ux%u from d2r_vr.ini (SteamVR recommended %ux%u%s)",chosen.width,chosen.height,recW,recH,chosen.clamped?"; clamped":"");
+    else std::snprintf(line,sizeof line,"Frame OpenXR: SteamVR eye target %ux%u (recommended %ux%u, max %ux%u%s)",chosen.width,chosen.height,recW,recH,maxW,maxH,chosen.clamped?"; clamped":"");
+    Say(line);
+}
+void StoreRecommended(uint32_t width,uint32_t height,uint32_t maxW,uint32_t maxH) {
+    recommendedPacked.store(PackSize(width,height),std::memory_order_release);
+    maxPacked.store(PackSize(maxW,maxH),std::memory_order_release);
+    RecomputeEye();
+}
+bool ReadViews() {
+    if(!instance||!system||!pEnumerateViewConfigurationViews)return false;
+    uint32_t count=0;
+    if(XR_FAILED(pEnumerateViewConfigurationViews(instance,system,XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO,0,&count,nullptr))||!count)return false;
+    std::vector<XrViewConfigurationView> configs(count,{XR_TYPE_VIEW_CONFIGURATION_VIEW});
+    if(XR_FAILED(pEnumerateViewConfigurationViews(instance,system,XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO,count,&count,configs.data()))||!count)return false;
+    uint32_t recW=0,recH=0,maxW=0xFFFFFFFFu,maxH=0xFFFFFFFFu;
+    char detail[160]="";size_t used=0;
+    for(uint32_t i=0;i<count&&i<4;++i) {
+        const auto& v=configs[i];
+        if(used+32>=sizeof detail)break;
+        used+=std::snprintf(detail+used,sizeof detail-used," view%u %ux%u",i,v.recommendedImageRectWidth,v.recommendedImageRectHeight);
+        if(!v.recommendedImageRectWidth||!v.recommendedImageRectHeight)continue;
+        recW=std::max(recW,v.recommendedImageRectWidth);
+        recH=std::max(recH,v.recommendedImageRectHeight);
+        if(v.maxImageRectWidth)maxW=std::min(maxW,v.maxImageRectWidth);
+        if(v.maxImageRectHeight)maxH=std::min(maxH,v.maxImageRectHeight);
+    }
+    if(!recW||!recH)return false;
+    if(maxW==0xFFFFFFFFu)maxW=0;
+    if(maxH==0xFFFFFFFFu)maxH=0;
+    if(recommendedPacked.load(std::memory_order_acquire)==PackSize(recW,recH)&&maxPacked.load(std::memory_order_acquire)==PackSize(maxW,maxH))return true;
+    char line[256];
+    std::snprintf(line,sizeof line,"Frame OpenXR: SteamVR view config%s; using %ux%u per eye",detail,recW,recH);
+    Say(line);
+    StoreRecommended(recW,recH,maxW,maxH);
+    return true;
+}
+bool ProbeTemporary() {
+    HMODULE mod=loader?loader:GetModuleHandleW(L"openxr_loader.dll");
+    if(!mod)mod=LoadLibraryW(L"openxr_loader.dll");
+    if(!mod)mod=LoadLibraryW(L"wineopenxr.dll");
+    if(!mod){if(!eyeProbeTold){eyeProbeTold=true;Say("Frame OpenXR: eye size probe found no loader");}return false;}
+    PFN_xrGetInstanceProcAddr resolve=reinterpret_cast<PFN_xrGetInstanceProcAddr>(GetProcAddress(mod,"xrGetInstanceProcAddr"));
+    if(!resolve) {
+        auto negotiate=reinterpret_cast<PFN_xrNegotiateLoaderRuntimeInterface>(GetProcAddress(mod,"xrNegotiateLoaderRuntimeInterface"));
+        if(!negotiate){if(!eyeProbeTold){eyeProbeTold=true;Say("Frame OpenXR: eye size probe has no OpenXR entry");}return false;}
+        XrNegotiateLoaderInfo li{XR_LOADER_INTERFACE_STRUCT_LOADER_INFO,XR_LOADER_INFO_STRUCT_VERSION,sizeof(XrNegotiateLoaderInfo),1,1,XR_API_VERSION_1_0,XR_API_VERSION_1_0};
+        XrNegotiateRuntimeRequest rr{XR_LOADER_INTERFACE_STRUCT_RUNTIME_REQUEST,XR_RUNTIME_INFO_STRUCT_VERSION,sizeof(XrNegotiateRuntimeRequest)};
+        if(XR_FAILED(negotiate(&li,&rr))||!rr.getInstanceProcAddr){if(!eyeProbeTold){eyeProbeTold=true;Say("Frame OpenXR: eye size probe could not negotiate the runtime");}return false;}
+        resolve=rr.getInstanceProcAddr;
+    }
+    PFN_xrCreateInstance create=nullptr;PFN_xrDestroyInstance destroy=nullptr;PFN_xrGetSystem getSystem=nullptr;PFN_xrEnumerateViewConfigurationViews enumViews=nullptr;
+    if(XR_FAILED(resolve(XR_NULL_HANDLE,"xrCreateInstance",reinterpret_cast<PFN_xrVoidFunction*>(&create)))||!create)return false;
+    XrInstanceCreateInfo ci{XR_TYPE_INSTANCE_CREATE_INFO};
+    std::strcpy(ci.applicationInfo.applicationName,"D2R Steam Frame prototype");
+    ci.applicationInfo.apiVersion=XR_API_VERSION_1_0;
+    XrInstance local=XR_NULL_HANDLE;
+    const XrResult created=create(&ci,&local);
+    if(XR_FAILED(created)||!local){if(!eyeProbeTold){eyeProbeTold=true;char b[96];std::snprintf(b,sizeof b,"Frame OpenXR: eye size probe instance failed (%d)",int(created));Say(b);}return false;}
+    resolve(local,"xrDestroyInstance",reinterpret_cast<PFN_xrVoidFunction*>(&destroy));
+    resolve(local,"xrGetSystem",reinterpret_cast<PFN_xrVoidFunction*>(&getSystem));
+    resolve(local,"xrEnumerateViewConfigurationViews",reinterpret_cast<PFN_xrVoidFunction*>(&enumViews));
+    auto release=[&]{if(destroy)destroy(local);};
+    if(!getSystem||!enumViews){release();return false;}
+    XrSystemGetInfo si{XR_TYPE_SYSTEM_GET_INFO};si.formFactor=XR_FORM_FACTOR_HEAD_MOUNTED_DISPLAY;
+    XrSystemId id=XR_NULL_SYSTEM_ID;
+    const XrResult systemResult=getSystem(local,&si,&id);
+    if(XR_FAILED(systemResult)){release();if(!eyeProbeTold){eyeProbeTold=true;char b[96];std::snprintf(b,sizeof b,"Frame OpenXR: eye size probe has no headset (%d)",int(systemResult));Say(b);}return false;}
+    uint32_t count=0;
+    if(XR_FAILED(enumViews(local,id,XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO,0,&count,nullptr))||!count){release();return false;}
+    std::vector<XrViewConfigurationView> found(count,{XR_TYPE_VIEW_CONFIGURATION_VIEW});
+    if(XR_FAILED(enumViews(local,id,XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO,count,&count,found.data()))||!count){release();return false;}
+    uint32_t recW=0,recH=0,maxW=0xFFFFFFFFu,maxH=0xFFFFFFFFu;
+    char detail[160]="";size_t used=0;
+    for(uint32_t i=0;i<count&&i<4;++i) {
+        const auto& v=found[i];
+        if(used+32>=sizeof detail)break;
+        used+=std::snprintf(detail+used,sizeof detail-used," view%u %ux%u",i,v.recommendedImageRectWidth,v.recommendedImageRectHeight);
+        if(!v.recommendedImageRectWidth||!v.recommendedImageRectHeight)continue;
+        recW=std::max(recW,v.recommendedImageRectWidth);recH=std::max(recH,v.recommendedImageRectHeight);
+        if(v.maxImageRectWidth)maxW=std::min(maxW,v.maxImageRectWidth);
+        if(v.maxImageRectHeight)maxH=std::min(maxH,v.maxImageRectHeight);
+    }
+    release();
+    if(!recW||!recH)return false;
+    if(maxW==0xFFFFFFFFu)maxW=0;
+    if(maxH==0xFFFFFFFFu)maxH=0;
+    eyeProbeTold=false;
+    char line[256];
+    std::snprintf(line,sizeof line,"Frame OpenXR: SteamVR view config%s; using %ux%u per eye",detail,recW,recH);
+    Say(line);
+    StoreRecommended(recW,recH,maxW,maxH);
+    return true;
+}
+bool QueryEyeTargetImpl() {
+    std::lock_guard lock(mutex);
+    if(instance&&system&&pEnumerateViewConfigurationViews)return ReadViews();
+    uint32_t haveW=0,haveH=0;UnpackSize(eyePacked.load(std::memory_order_acquire),haveW,haveH);
+    if(haveW&&haveH)return true;
+    return ProbeTemporary();
+}
+bool LoadEye(uint32_t* width,uint32_t* height) {
+    uint32_t w=0,h=0;UnpackSize(eyePacked.load(std::memory_order_acquire),w,h);
+    if(!w||!h)return false;
+    if(width)*width=w;if(height)*height=h;return true;
+}
+bool LoadDesk(uint32_t* width,uint32_t* height) {
+    uint32_t w=0,h=0;UnpackSize(deskPacked.load(std::memory_order_acquire),w,h);
+    if(!w||!h)return false;
+    if(width)*width=w;if(height)*height=h;return true;
+}
+thread_local bool eyeFixing=false;
+thread_local reshade::api::command_list* eyeList=nullptr;
+thread_local uint32_t eyeBoundW=0,eyeBoundH=0;
+thread_local bool eyeHaveVp=false,eyeHaveSc=false;
+thread_local D3D12_VIEWPORT eyeVp{};
+thread_local D3D12_RECT eyeSc{};
+void RememberEyeList(reshade::api::command_list* cl) {
+    if(eyeList==cl)return;
+    eyeList=cl;eyeBoundW=eyeBoundH=0;eyeHaveVp=eyeHaveSc=false;
+}
+void ApplyEyeViewport(reshade::api::command_list* cl) {
+    if(eyeFixing||!eyeHaveVp||!cl)return;
+    uint32_t ew=0,eh=0,dw=0,dh=0;
+    if(!LoadEye(&ew,&eh)||!LoadDesk(&dw,&dh))return;
+    const BoxFix fixed=FitDesktopBox(eyeVp.TopLeftX,eyeVp.TopLeftY,eyeVp.Width,eyeVp.Height,ew,eh,dw,dh,eyeBoundW,eyeBoundH);
+    if(!fixed.changed)return;
+    eyeFixing=true;
+    D3D12_VIEWPORT vp{fixed.x,fixed.y,fixed.w,fixed.h,eyeVp.MinDepth,eyeVp.MaxDepth};
+    reinterpret_cast<ID3D12GraphicsCommandList*>(cl->get_native())->RSSetViewports(1,&vp);
+    eyeFixing=false;
+    if(eyeRetargets.fetch_add(1)==0) {
+        char line[200];
+        std::snprintf(line,sizeof line,"Frame OpenXR: desktop viewport %.0fx%.0f on the eye target scaled to %.0fx%.0f",eyeVp.Width,eyeVp.Height,fixed.w,fixed.h);
+        Say(line);
+    }
+}
+void ApplyEyeScissor(reshade::api::command_list* cl) {
+    if(eyeFixing||!eyeHaveSc||!cl)return;
+    uint32_t ew=0,eh=0,dw=0,dh=0;
+    if(!LoadEye(&ew,&eh)||!LoadDesk(&dw,&dh))return;
+    const float w=float(eyeSc.right-eyeSc.left),h=float(eyeSc.bottom-eyeSc.top);
+    const BoxFix fixed=FitDesktopBox(float(eyeSc.left),float(eyeSc.top),w,h,ew,eh,dw,dh,eyeBoundW,eyeBoundH);
+    if(!fixed.changed)return;
+    eyeFixing=true;
+    D3D12_RECT rc{LONG(fixed.x),LONG(fixed.y),LONG(fixed.x+fixed.w),LONG(fixed.y+fixed.h)};
+    reinterpret_cast<ID3D12GraphicsCommandList*>(cl->get_native())->RSSetScissorRects(1,&rc);
+    eyeFixing=false;
+}
+void OnEyeTargets(reshade::api::command_list* cl,uint32_t count,const reshade::api::resource_view* rtvs,reshade::api::resource_view dsv) {
+    RememberEyeList(cl);
+    eyeBoundW=eyeBoundH=0;
+    auto* dev=cl->get_device();
+    auto read=[&](reshade::api::resource_view view) {
+        if(!view.handle)return;
+        const auto desc=dev->get_resource_desc(dev->get_resource_from_view(view));
+        if(desc.type!=reshade::api::resource_type::texture_2d&&desc.type!=reshade::api::resource_type::surface)return;
+        eyeBoundW=desc.texture.width;eyeBoundH=desc.texture.height;
+    };
+    if(count&&rtvs)read(rtvs[0]);
+    if(!eyeBoundW)read(dsv);
+    ApplyEyeViewport(cl);ApplyEyeScissor(cl);
+}
+void OnEyeViewports(reshade::api::command_list* cl,uint32_t first,uint32_t count,const reshade::api::viewport* vps) {
+    if(eyeFixing)return;
+    RememberEyeList(cl);
+    if(first||count!=1||!vps){eyeHaveVp=false;return;}
+    eyeVp={vps[0].x,vps[0].y,vps[0].width,vps[0].height,vps[0].min_depth,vps[0].max_depth};
+    eyeHaveVp=true;
+    ApplyEyeViewport(cl);
+}
+void OnEyeScissors(reshade::api::command_list* cl,uint32_t first,uint32_t count,const reshade::api::rect* rects) {
+    if(eyeFixing)return;
+    RememberEyeList(cl);
+    if(first||count!=1||!rects){eyeHaveSc=false;return;}
+    eyeSc={rects[0].left,rects[0].top,rects[0].right,rects[0].bottom};
+    eyeHaveSc=true;
+    ApplyEyeScissor(cl);
+}
+bool OnCreateSwapchain(reshade::api::device_api,reshade::api::swapchain_desc& desc,void* hwnd) {
+    uint32_t ew=0,eh=0;
+    if(!LoadEye(&ew,&eh))return false;
+    const uint32_t rw=desc.back_buffer.texture.width,rh=desc.back_buffer.texture.height;
+    if(!IsScreenSwapchain(rw,rh,hwnd!=nullptr))return false;
+    bool changed=false;
+    if(desc.fullscreen_state){desc.fullscreen_state=false;changed=true;}
+    if(rw!=ew||rh!=eh) {
+        if(!deskPacked.load(std::memory_order_acquire))deskPacked.store(PackSize(rw,rh),std::memory_order_release);
+        desc.back_buffer.texture.width=ew;desc.back_buffer.texture.height=eh;changed=true;
+        static uint64_t lastLogged=0;
+        const uint64_t key=PackSize(rw,rh)^(PackSize(ew,eh)<<1);
+        if(lastLogged!=key){lastLogged=key;char line[160];std::snprintf(line,sizeof line,"Frame OpenXR: swapchain %ux%u -> SteamVR eye %ux%u",rw,rh,ew,eh);Say(line);}
+    }
+    return changed;
+}
 bool LoadFunctions() {
     // Proton's WineOpenXR exports the runtime negotiation entrypoint.
     // Negotiate it directly, or use a standard Windows loader as a fallback.
@@ -477,6 +689,7 @@ bool LoadFunctions() {
         gazeSupported=Check(pGetSystemProperties(instance,system,&sp),"query eye-gaze system")&&gazeProps.supportsEyeGazeInteraction;
         Say(gazeSupported?"Frame gaze: system supports eye tracking; awaiting tracked samples":"Frame gaze: system has no usable eye tracker; full-quality fallback");
     } else if(eyeTracking.load())Say("Frame gaze: extension unavailable; full-quality fallback");
+    if(!ReadViews())Say("Frame OpenXR: SteamVR did not report an eye texture size; the game window stays the monitor");
     return true;
 }
 XrPath Path(const char* p) { XrPath out=XR_NULL_PATH;pStringToPath(instance,p,&out);return out; }
@@ -732,7 +945,9 @@ bool Initialize(reshade::api::command_queue* rq,reshade::api::swapchain* swap) {
     if(!tracking.Open(D2RVR_SHARED_NAME)||!pad.Open(BW_PAD_MIRROR_NAME)||!actions.Open(D2RVR_ACTIONS_NAME)) return false;
     tracking.data->version=D2RVR_SHARED_VERSION;pad.data->version=BW_PAD_MIRROR_VERSION;actions.data->version=D2RVR_ACTIONS_VERSION;
     gameSwapchain=swap;
-    char b[160];std::snprintf(b,sizeof b,"Frame OpenXR: D3D12 session ready, eyes %ux%u format %d (game format %d)",width,height,int(eyeFormat),int(format));Say(b);
+    uint32_t targetW=0,targetH=0;const bool haveTarget=LoadEye(&targetW,&targetH);
+    char b[220];std::snprintf(b,sizeof b,"Frame OpenXR: D3D12 session ready, eyes %ux%u format %d (game format %d), SteamVR target %ux%u",width,height,int(eyeFormat),int(format),targetW,targetH);Say(b);
+    if(haveTarget&&(width!=targetW||height!=targetH))Say("Frame OpenXR: backbuffer is not the SteamVR eye yet; the game window is being resized to it");
     return true;
 }
 bool Bool(XrAction action,int hand) {
@@ -1667,14 +1882,19 @@ bool HandleWindowFocusMessage(void* window,uint32_t message,uint64_t token,int64
 
 void Register(LogFn log,PanelFn panel,PanelFn world,PanelFn toggle) {
     std::lock_guard lock(mutex);logger=log;wantsPanel=panel;inWorld=world;toggleMenus=toggle;if(registered)return;
+    reshade::register_event<reshade::addon_event::create_swapchain>(&OnCreateSwapchain);
     reshade::register_event<reshade::addon_event::present>(&Prepare);
     reshade::register_event<reshade::addon_event::reshade_present>(&AfterEffects);
     reshade::register_event<reshade::addon_event::reshade_begin_effects>(&ProfileEffects);
     reshade::register_event<reshade::addon_event::destroy_swapchain>(&DestroySwap);
+    reshade::register_event<reshade::addon_event::bind_render_targets_and_depth_stencil>(&OnEyeTargets);
+    reshade::register_event<reshade::addon_event::bind_viewports>(&OnEyeViewports);
+    reshade::register_event<reshade::addon_event::bind_scissor_rects>(&OnEyeScissors);
     reshade::register_event<reshade::addon_event::create_pipeline>(&PipelineCreating);
     reshade::register_event<reshade::addon_event::init_pipeline>(&PipelineCreated);
     foveation::Register(log);
     registered=true;Say("Frame OpenXR: registered D3D12 capture; awaiting game Present");
+    QueryEyeTargetImpl();
 }
 bool SpatialMenu(){return uiSupported.load()&&uiworld::Ready()&&hud::LayerFound()&&inWorld&&inWorld()&&wantsPanel&&wantsPanel();}
 bool Active() {std::lock_guard lock(mutex);return frame&&valid&&render&&!failed&&!panelMode;}
@@ -1683,6 +1903,13 @@ void ConfigureDeferredWait(bool on) {
 }
 void ConfigureSymmetricProjection(bool on) {symmetricProjection.store(on);}
 void ConfigureEyeTracking(bool on) {eyeTracking.store(on);}
+void ConfigureEyeRenderSize(uint32_t width,uint32_t height) {
+    overridePacked.store(PackSize(width,height),std::memory_order_release);
+    RecomputeEye();
+}
+bool EyeRenderSize(uint32_t* width,uint32_t* height) {return LoadEye(width,height);}
+bool DesktopRenderSize(uint32_t* width,uint32_t* height) {return LoadDesk(width,height);}
+bool QueryEyeTarget() {return QueryEyeTargetImpl();}
 void BeginEye(int eye) {
     hud::UiFrame(spatialMode,!journalMode,eye);
     std::lock_guard lock(mutex);

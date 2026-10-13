@@ -783,6 +783,8 @@ void LoadSettings() {
 #endif
 #ifdef D2RVR_NATIVE_OPENXR
     framevr::foveation::Configure(IniB(L"render",L"fixed_foveation",true),IniF(L"render",L"foveation_inner",0.55f),IniF(L"render",L"gaze_foveation_inner",0.35f));
+    framevr::ConfigureEyeRenderSize((uint32_t)std::max(0.f, IniF(L"render", L"eye_width", 0.f)),
+                                    (uint32_t)std::max(0.f, IniF(L"render", L"eye_height", 0.f)));
     d2rcam::SetStereoLabels(IniB(L"hud",L"stereo_labels",true));
     d2rcam::SetMonsterDrawOrder(IniB(L"hud",L"monster_draw_order",true));
     // Remote debugging can request the same one-shot capture without stealing
@@ -3893,15 +3895,19 @@ bool GameFocused() {
 // The game's main window: its biggest visible top-level window.
 HWND g_gameWnd = nullptr;
 WNDPROC g_gameWndProc = nullptr;
+using GetClientRectFn = BOOL (WINAPI*)(HWND, LPRECT);
+GetClientRectFn OrigGetClientRect = nullptr;
+uint32_t g_monitorW = 0, g_monitorH = 0;
 
 BOOL CALLBACK FindGameWindow(HWND h, LPARAM best) {
     DWORD pid = 0;
     GetWindowThreadProcessId(h, &pid);
     RECT rc{};
-    if (pid != GetCurrentProcessId() || !IsWindowVisible(h) || GetWindow(h, GW_OWNER) || !GetClientRect(h, &rc)) return TRUE;
+    const auto client = OrigGetClientRect ? OrigGetClientRect : GetClientRect;
+    if (pid != GetCurrentProcessId() || !IsWindowVisible(h) || GetWindow(h, GW_OWNER) || !client(h, &rc)) return TRUE;
     HWND* out = (HWND*)best;
     RECT cur{};
-    if (!*out || (GetClientRect(*out, &cur) && (rc.right * rc.bottom > cur.right * cur.bottom))) *out = h;
+    if (!*out || (client(*out, &cur) && (rc.right * rc.bottom > cur.right * cur.bottom))) *out = h;
     return TRUE;
 }
 
@@ -4113,9 +4119,267 @@ void HookCursor() {
 // W A S D are ours while the shooter controls are on (the game has skills
 // and panels on them) - but not while the chat line is open: then they are
 // letters, and every other key goes to the game anyway.
+#ifdef D2RVR_NATIVE_OPENXR
+// The headset copy is the swapchain, 1:1. The game builds its scene targets from
+// the monitor unless the window, client rect and display mode all say otherwise.
+struct EyeOuter { int w, h; };
+EyeOuter EyeOuterSize(HWND h, uint32_t ew, uint32_t eh) {
+    RECT r{0, 0, (LONG)ew, (LONG)eh};
+    const DWORD style = (DWORD)GetWindowLongW(h, GWL_STYLE);
+    const DWORD ex = (DWORD)GetWindowLongW(h, GWL_EXSTYLE);
+    if (!AdjustWindowRectEx(&r, style, GetMenu(h) != nullptr, ex)) return {(int)ew, (int)eh};
+    return {r.right - r.left, r.bottom - r.top};
+}
+bool LooksLikeGameClient(int w, int h) {
+    if (w < 800 || h < 600 || w > 16384 || h > 16384) return false;
+    if (!g_monitorW || !g_monitorH) return w >= 1600 && h >= 900;
+    const int dw = w - (int)g_monitorW, dh = h - (int)g_monitorH;
+    if (dw > -80 && dw < 160 && dh > -80 && dh < 160) return true;
+    return (long)w * h >= (long)g_monitorW * (long)g_monitorH / 2 && w >= 1600 && h >= 800;
+}
+void NoteGameWindow(HWND hwnd, int w, int h) {
+    if (!hwnd || !LooksLikeGameClient(w, h)) return;
+    RECT cur{};
+    if (!g_gameWnd || !OrigGetClientRect || !OrigGetClientRect(g_gameWnd, &cur) || (long)w * h > (long)cur.right * cur.bottom)
+        g_gameWnd = hwnd;
+}
+bool ApplyEyeClient(HWND h) {
+    uint32_t ew = 0, eh = 0;
+    if (!h || !IsWindow(h) || !OrigGetClientRect || !framevr::EyeRenderSize(&ew, &eh)) return false;
+    RECT client{};
+    if (!OrigGetClientRect(h, &client)) return false;
+    if ((UINT)client.right == ew && (UINT)client.bottom == eh && client.left == 0 && client.top == 0) {
+        static uint32_t toldW = 0, toldH = 0;
+        if (toldW != ew || toldH != eh) {
+            toldW = ew; toldH = eh;
+            LogF("vrcam: game window client is the SteamVR eye %ux%u", ew, eh);
+        }
+        return true;
+    }
+    const DWORD style = (DWORD)GetWindowLongW(h, GWL_STYLE);
+    if (style & WS_MAXIMIZE) {
+        SetWindowLongW(h, GWL_STYLE, style & ~WS_MAXIMIZE);
+        ShowWindow(h, SW_RESTORE);
+    }
+    const EyeOuter outer = EyeOuterSize(h, ew, eh);
+    static bool placed = false;
+    const UINT flags = SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED | (placed ? SWP_NOMOVE : 0);
+    SetWindowPos(h, nullptr, 0, 0, outer.w, outer.h, flags);
+    placed = true;
+    RECT after{};
+    OrigGetClientRect(h, &after);
+    static ULONGLONG nextLog = 0;
+    static int misses = 0;
+    static uint32_t missW = 0, missH = 0;
+    if (missW != ew || missH != eh) { missW = ew; missH = eh; misses = 0; }
+    const ULONGLONG now = GetTickCount64();
+    if (now >= nextLog) {
+        nextLog = now + 2000;
+        LogF("vrcam: game window client %ldx%ld -> %ldx%ld (SteamVR eye %ux%u)", client.right, client.bottom, after.right, after.bottom, ew, eh);
+    }
+    if ((UINT)after.right == ew && (UINT)after.bottom == eh) return true;
+    // The client lie still makes the game allocate the eye size when the
+    // desktop refuses a window taller than the monitor.
+    return ++misses > 40;
+}
+void ForceOuter(WINDOWPOS* wp, HWND h) {
+    if (!wp || (wp->flags & SWP_NOSIZE)) return;
+    uint32_t ew = 0, eh = 0;
+    if (h != g_gameWnd || !framevr::EyeRenderSize(&ew, &eh)) return;
+    const EyeOuter outer = EyeOuterSize(h, ew, eh);
+    wp->cx = outer.w; wp->cy = outer.h;
+}
+using CreateWindowExWFn = HWND (WINAPI*)(DWORD, LPCWSTR, LPCWSTR, DWORD, int, int, int, int, HWND, HMENU, HINSTANCE, LPVOID);
+using SetWindowPosFn = BOOL (WINAPI*)(HWND, HWND, int, int, int, int, UINT);
+using MoveWindowFn = BOOL (WINAPI*)(HWND, int, int, int, int, BOOL);
+using GetSystemMetricsFn = int (WINAPI*)(int);
+using GetSystemMetricsForDpiFn = int (WINAPI*)(int, UINT);
+using EnumDisplaySettingsWFn = BOOL (WINAPI*)(LPCWSTR, DWORD, DEVMODEW*);
+using EnumDisplaySettingsExWFn = BOOL (WINAPI*)(LPCWSTR, DWORD, DEVMODEW*, DWORD);
+using ChangeDisplaySettingsWFn = LONG (WINAPI*)(DEVMODEW*, DWORD);
+using ChangeDisplaySettingsExWFn = LONG (WINAPI*)(LPCWSTR, DEVMODEW*, HWND, DWORD, LPVOID);
+using SystemParametersInfoWFn = BOOL (WINAPI*)(UINT, UINT, PVOID, UINT);
+using ShowWindowFn = BOOL (WINAPI*)(HWND, int);
+using SetWindowPlacementFn = BOOL (WINAPI*)(HWND, const WINDOWPLACEMENT*);
+CreateWindowExWFn OrigCreateWindowExW = nullptr;
+SetWindowPosFn OrigSetWindowPos = nullptr;
+MoveWindowFn OrigMoveWindow = nullptr;
+GetSystemMetricsFn OrigGetSystemMetrics = nullptr;
+GetSystemMetricsForDpiFn OrigGetSystemMetricsForDpi = nullptr;
+EnumDisplaySettingsWFn OrigEnumDisplaySettingsW = nullptr;
+EnumDisplaySettingsExWFn OrigEnumDisplaySettingsExW = nullptr;
+ChangeDisplaySettingsWFn OrigChangeDisplaySettingsW = nullptr;
+ChangeDisplaySettingsExWFn OrigChangeDisplaySettingsExW = nullptr;
+SystemParametersInfoWFn OrigSystemParametersInfoW = nullptr;
+ShowWindowFn OrigShowWindow = nullptr;
+SetWindowPlacementFn OrigSetWindowPlacement = nullptr;
+int EyeMetric(int n, int real) {
+    uint32_t ew = 0, eh = 0;
+    if (!framevr::EyeRenderSize(&ew, &eh)) return real;
+    if (n == SM_CXSCREEN || n == SM_CXFULLSCREEN) return (int)ew;
+    if (n == SM_CYSCREEN || n == SM_CYFULLSCREEN) return (int)eh;
+    return real;
+}
+void PatchDisplayMode(DEVMODEW* dm) {
+    uint32_t ew = 0, eh = 0;
+    if (!dm || !g_monitorW || !g_monitorH || !framevr::EyeRenderSize(&ew, &eh)) return;
+    const uint64_t pixels = (uint64_t)dm->dmPelsWidth * dm->dmPelsHeight;
+    const uint64_t monitorPixels = (uint64_t)g_monitorW * g_monitorH;
+    const bool native = dm->dmPelsWidth == g_monitorW && dm->dmPelsHeight == g_monitorH;
+    if (!native && (!monitorPixels || pixels < monitorPixels)) return;
+    dm->dmPelsWidth = ew; dm->dmPelsHeight = eh;
+    dm->dmFields |= DM_PELSWIDTH | DM_PELSHEIGHT;
+}
+bool BlockDisplayChange() {
+    uint32_t ew = 0, eh = 0;
+    if (!framevr::EyeRenderSize(&ew, &eh)) return false;
+    static bool told = false;
+    if (!told) { told = true; Log("vrcam: kept the desktop display mode; the game renders at the SteamVR eye size"); }
+    return true;
+}
+HWND WINAPI HookCreateWindowExW(DWORD ex, LPCWSTR cls, LPCWSTR title, DWORD style, int x, int y, int w, int h, HWND parent, HMENU menu, HINSTANCE inst, LPVOID param) {
+    uint32_t ew = 0, eh = 0;
+    const bool top = parent == nullptr;
+    const bool preset = top && LooksLikeGameClient(w, h) && framevr::EyeRenderSize(&ew, &eh);
+    if (preset) {
+        RECT r{0, 0, (LONG)ew, (LONG)eh};
+        if (AdjustWindowRectEx(&r, style, menu != nullptr, ex)) { w = r.right - r.left; h = r.bottom - r.top; }
+        else { w = (int)ew; h = (int)eh; }
+        style &= ~WS_MAXIMIZE;
+        x = 0; y = 0;
+    }
+    HWND hwnd = OrigCreateWindowExW(ex, cls, title, style, x, y, w, h, parent, menu, inst, param);
+    if (!hwnd || !top || !OrigGetClientRect) return hwnd;
+    RECT rc{};
+    if (!OrigGetClientRect(hwnd, &rc)) return hwnd;
+    if (preset || LooksLikeGameClient(rc.right, rc.bottom))
+        NoteGameWindow(hwnd, std::max(rc.right, (LONG)w), std::max(rc.bottom, (LONG)h));
+    return hwnd;
+}
+BOOL WINAPI HookSetWindowPos(HWND hwnd, HWND after, int x, int y, int cx, int cy, UINT flags) {
+    if (hwnd == g_gameWnd && !(flags & SWP_NOSIZE)) {
+        uint32_t ew = 0, eh = 0;
+        if (framevr::EyeRenderSize(&ew, &eh)) {
+            const EyeOuter outer = EyeOuterSize(hwnd, ew, eh);
+            cx = outer.w; cy = outer.h;
+        }
+    }
+    return OrigSetWindowPos(hwnd, after, x, y, cx, cy, flags);
+}
+BOOL WINAPI HookMoveWindow(HWND hwnd, int x, int y, int w, int h, BOOL repaint) {
+    if (hwnd == g_gameWnd) {
+        uint32_t ew = 0, eh = 0;
+        if (framevr::EyeRenderSize(&ew, &eh)) {
+            const EyeOuter outer = EyeOuterSize(hwnd, ew, eh);
+            w = outer.w; h = outer.h;
+        }
+    }
+    return OrigMoveWindow(hwnd, x, y, w, h, repaint);
+}
+BOOL WINAPI HookGetClientRect(HWND hwnd, LPRECT r) {
+    const BOOL ok = OrigGetClientRect(hwnd, r);
+    if (!ok || !r || hwnd != g_gameWnd) return ok;
+    uint32_t ew = 0, eh = 0;
+    if (!framevr::EyeRenderSize(&ew, &eh)) return ok;
+    r->left = 0; r->top = 0; r->right = (LONG)ew; r->bottom = (LONG)eh;
+    return ok;
+}
+int WINAPI HookGetSystemMetrics(int n) { return EyeMetric(n, OrigGetSystemMetrics(n)); }
+int WINAPI HookGetSystemMetricsForDpi(int n, UINT dpi) { return EyeMetric(n, OrigGetSystemMetricsForDpi(n, dpi)); }
+BOOL WINAPI HookEnumDisplaySettingsW(LPCWSTR dev, DWORD mode, DEVMODEW* dm) {
+    const BOOL ok = OrigEnumDisplaySettingsW(dev, mode, dm);
+    if (ok) PatchDisplayMode(dm);
+    return ok;
+}
+BOOL WINAPI HookEnumDisplaySettingsExW(LPCWSTR dev, DWORD mode, DEVMODEW* dm, DWORD flags) {
+    const BOOL ok = OrigEnumDisplaySettingsExW(dev, mode, dm, flags);
+    if (ok) PatchDisplayMode(dm);
+    return ok;
+}
+LONG WINAPI HookChangeDisplaySettingsW(DEVMODEW* dm, DWORD flags) {
+    if (BlockDisplayChange()) return DISP_CHANGE_SUCCESSFUL;
+    return OrigChangeDisplaySettingsW(dm, flags);
+}
+LONG WINAPI HookChangeDisplaySettingsExW(LPCWSTR dev, DEVMODEW* dm, HWND hwnd, DWORD flags, LPVOID param) {
+    if (BlockDisplayChange()) return DISP_CHANGE_SUCCESSFUL;
+    return OrigChangeDisplaySettingsExW(dev, dm, hwnd, flags, param);
+}
+BOOL WINAPI HookSystemParametersInfoW(UINT action, UINT param, PVOID out, UINT ini) {
+    const BOOL ok = OrigSystemParametersInfoW(action, param, out, ini);
+    if (!ok || action != SPI_GETWORKAREA || !out) return ok;
+    uint32_t ew = 0, eh = 0;
+    if (!framevr::EyeRenderSize(&ew, &eh)) return ok;
+    RECT* r = (RECT*)out;
+    r->left = 0; r->top = 0; r->right = (LONG)ew; r->bottom = (LONG)eh;
+    return ok;
+}
+BOOL WINAPI HookShowWindow(HWND hwnd, int cmd) {
+    if (hwnd == g_gameWnd && (cmd == SW_MAXIMIZE || cmd == SW_SHOWMAXIMIZED) && framevr::EyeRenderSize(nullptr, nullptr))
+        cmd = SW_SHOWNORMAL;
+    return OrigShowWindow(hwnd, cmd);
+}
+BOOL WINAPI HookSetWindowPlacement(HWND hwnd, const WINDOWPLACEMENT* in) {
+    if (!in || hwnd != g_gameWnd) return OrigSetWindowPlacement(hwnd, in);
+    uint32_t ew = 0, eh = 0;
+    if (!framevr::EyeRenderSize(&ew, &eh)) return OrigSetWindowPlacement(hwnd, in);
+    WINDOWPLACEMENT p = *in;
+    p.length = sizeof p;
+    if (p.showCmd == SW_MAXIMIZE || p.showCmd == SW_SHOWMAXIMIZED) p.showCmd = SW_SHOWNORMAL;
+    const EyeOuter outer = EyeOuterSize(hwnd, ew, eh);
+    p.rcNormalPosition = {0, 0, outer.w, outer.h};
+    return OrigSetWindowPlacement(hwnd, &p);
+}
+void InstallEyeWindowHooks() {
+    g_monitorW = (uint32_t)GetSystemMetrics(SM_CXSCREEN);
+    g_monitorH = (uint32_t)GetSystemMetrics(SM_CYSCREEN);
+    LogF("vrcam: desktop is %ux%u; each eye renders at the SteamVR size", g_monitorW, g_monitorH);
+    auto hook = [](const char* name, void* detour, void** orig) {
+        void* fn = (void*)GetProcAddress(GetModuleHandleW(L"user32.dll"), name);
+        const bool ok = fn && MH_CreateHook(fn, detour, orig) == MH_OK && MH_EnableHook(fn) == MH_OK;
+        if (!ok) LogF("vrcam: user32!%s hook FAILED", name);
+    };
+    hook("CreateWindowExW", (void*)&HookCreateWindowExW, (void**)&OrigCreateWindowExW);
+    hook("SetWindowPos", (void*)&HookSetWindowPos, (void**)&OrigSetWindowPos);
+    hook("MoveWindow", (void*)&HookMoveWindow, (void**)&OrigMoveWindow);
+    hook("GetClientRect", (void*)&HookGetClientRect, (void**)&OrigGetClientRect);
+    hook("GetSystemMetrics", (void*)&HookGetSystemMetrics, (void**)&OrigGetSystemMetrics);
+    hook("GetSystemMetricsForDpi", (void*)&HookGetSystemMetricsForDpi, (void**)&OrigGetSystemMetricsForDpi);
+    hook("EnumDisplaySettingsW", (void*)&HookEnumDisplaySettingsW, (void**)&OrigEnumDisplaySettingsW);
+    hook("EnumDisplaySettingsExW", (void*)&HookEnumDisplaySettingsExW, (void**)&OrigEnumDisplaySettingsExW);
+    hook("ChangeDisplaySettingsW", (void*)&HookChangeDisplaySettingsW, (void**)&OrigChangeDisplaySettingsW);
+    hook("ChangeDisplaySettingsExW", (void*)&HookChangeDisplaySettingsExW, (void**)&OrigChangeDisplaySettingsExW);
+    hook("SystemParametersInfoW", (void*)&HookSystemParametersInfoW, (void**)&OrigSystemParametersInfoW);
+    hook("ShowWindow", (void*)&HookShowWindow, (void**)&OrigShowWindow);
+    hook("SetWindowPlacement", (void*)&HookSetWindowPlacement, (void**)&OrigSetWindowPlacement);
+}
+#endif
+
 LRESULT CALLBACK GameWndProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
 #ifdef D2RVR_NATIVE_OPENXR
     if(framevr::HandleWindowFocusMessage(h,msg,w,l))return 0;
+    if (msg == WM_GETMINMAXINFO && l && g_gameWndProc) {
+        const LRESULT r = CallWindowProcW(g_gameWndProc, h, msg, w, l);
+        uint32_t ew = 0, eh = 0;
+        if (h == g_gameWnd && framevr::EyeRenderSize(&ew, &eh)) {
+            auto* m = (MINMAXINFO*)l;
+            const EyeOuter outer = EyeOuterSize(h, ew, eh);
+            if (m->ptMaxTrackSize.x < outer.w) m->ptMaxTrackSize.x = outer.w;
+            if (m->ptMaxTrackSize.y < outer.h) m->ptMaxTrackSize.y = outer.h;
+            if (m->ptMaxSize.x < outer.w) m->ptMaxSize.x = outer.w;
+            if (m->ptMaxSize.y < outer.h) m->ptMaxSize.y = outer.h;
+        }
+        return r;
+    }
+    if (msg == WM_WINDOWPOSCHANGING && l && g_gameWndProc) {
+        ForceOuter((WINDOWPOS*)l, h);
+        const LRESULT r = CallWindowProcW(g_gameWndProc, h, msg, w, l);
+        ForceOuter((WINDOWPOS*)l, h);
+        return r;
+    }
+    if (msg == WM_SIZE && w != SIZE_MINIMIZED) {
+        uint32_t ew = 0, eh = 0;
+        if (h == g_gameWnd && framevr::EyeRenderSize(&ew, &eh)) l = MAKELPARAM(ew, eh);
+    }
 #endif
     // F1..F3 (F4 in VR) pick the view: the game, which has skills on them, never sees them.
     if ((msg == WM_KEYDOWN || msg == WM_KEYUP) && w >= VK_F1 && (int)w < VK_F1 + ViewCount()) return 0;
@@ -7650,6 +7914,21 @@ DWORD WINAPI UpdateThread(void*) {
         const ULONGLONG nowMs = GetTickCount64();
 #ifdef D2RVR_NATIVE_OPENXR
         framevr::hookmetrics::Scope inputMeasured(framevr::hookmetrics::InputTick,15);
+        {
+            static ULONGLONG nextEye = 0, nextQuery = 0;
+            static bool eyeLatched = false;
+            if (nowMs >= nextEye) {
+                uint32_t ew = 0, eh = 0;
+                const bool have = framevr::EyeRenderSize(&ew, &eh);
+                nextEye = nowMs + (have && eyeLatched ? 500 : 50);
+                if (nowMs >= nextQuery) {
+                    nextQuery = nowMs + (have ? 5000 : 1000);
+                    framevr::QueryEyeTarget();
+                }
+                if (!g_gameWndProc) HookGameWindow();
+                eyeLatched = ApplyEyeClient(g_gameWnd);
+            }
+        }
 #endif
         const bool focus = GameFocused();
         if (f12.Pressed(focus)) Toggle();
@@ -7945,10 +8224,22 @@ D2RL_PLUGIN_EXPORT bool D2RLoaderLoadPlugin(const PluginContext* ctx) noexcept {
     d2rsig::Resolve(ctx);
 
     LoadReShade();
+#ifdef D2RVR_NATIVE_OPENXR
+    fx::TryRegister();
+    framevr::QueryEyeTarget();
+    {
+        uint32_t ew = 0, eh = 0;
+        if (framevr::EyeRenderSize(&ew, &eh)) LogF("vrcam: SteamVR eye render target %ux%u", ew, eh);
+        else Log("vrcam: SteamVR eye render target not ready yet");
+    }
+#endif
     d2rcam::SetCallbacks(&VrView, &VrProj);
     d2rcam::SetFrameCallback(&VrFrame);
     d2rcam::SetRayOverride(&VrRay);
-    MH_Initialize();   // XInput only; game code is hooked through the loader
+    MH_Initialize();   // XInput, and the eye-size window hooks; game code is hooked through the loader
+#ifdef D2RVR_NATIVE_OPENXR
+    InstallEyeWindowHooks();
+#endif
     skel::SetGameBase(g_base);
     skel::TrackHero(true);   // the hero's SkeletonInstance is how his facing is found (FacingStructural)
     skel::SetFresh(&FreshYawInModel);

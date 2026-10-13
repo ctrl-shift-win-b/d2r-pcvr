@@ -14,6 +14,11 @@ bool HandleWindowFocusMessage(void* window,uint32_t message,uint64_t token,int64
 void ConfigureDeferredWait(bool enabled);
 void ConfigureSymmetricProjection(bool enabled);
 void ConfigureEyeTracking(bool enabled);
+// 0,0 uses the SteamVR recommended eye image. A pair is an explicit override.
+void ConfigureEyeRenderSize(uint32_t width, uint32_t height);
+bool EyeRenderSize(uint32_t* width, uint32_t* height);
+bool DesktopRenderSize(uint32_t* width, uint32_t* height);
+bool QueryEyeTarget();
 void ConfigureGameplay(bool enabled);
 void ConfigureInteractions(bool seated,float waistBelowEyes,float beltForward,int dominantHand);
 // Current motion-combat aim in the existing head-yaw-relative hand frame.

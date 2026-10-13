@@ -104,6 +104,7 @@ add_executable(gaze-test gaze_test.cpp)
 add_executable(window-focus-test window_focus_test.cpp)
 add_executable(callback-ticket-test callback_ticket_test.cpp)
 add_executable(local-player-test local_player_test.cpp ${ROOT}/vr/combat.cpp)
+add_executable(eye-size-test eye_size_test.cpp)
 target_include_directories(local-player-test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${ROOT}/cleanroom/sigscan)
 target_link_libraries(local-player-test PRIVATE framevr-runtime)
 target_link_libraries(window-focus-test PRIVATE user32)
@@ -113,7 +114,8 @@ foreach(test_target IN ITEMS memory-test hook-metrics-test latest-worker-test
     portal-billboard-test composition-layers-test projectile-rules-test
     combat-rules-test logging-test melee-contact-test world-coordinates-test bow-flight-test
     interaction-test wrist-hud-test controller-bindings-test journal-test native-panels-test
-    vr-settings-test vr-settings-store-test math-test deferred-draw-test gaze-test window-focus-test callback-ticket-test local-player-test)
+    vr-settings-test vr-settings-store-test math-test deferred-draw-test gaze-test window-focus-test callback-ticket-test local-player-test
+    eye-size-test)
   # These fixtures use assert for their checks, including in Release builds.
   if(MSVC)
     target_compile_options(${test_target} PRIVATE /UNDEBUG)
