@@ -65,7 +65,7 @@ int FindHeroMatrices(const float hero[3], uintptr_t* out, int max);
 namespace uitrace { void Register(bool diagnostic); bool Enabled(); bool Arm(const std::wstring& path); void SetSkip(uint64_t pipe); void SetSkipShaders(const uint64_t* hashes, int n); }
 #include "game_hud_shared.h"
 namespace memdiff { void Step(uintptr_t base, const std::wstring& outPath, void (*log)(const char*)); void Reset(void (*log)(const char*)); }
-namespace hud { void Register(); void SetHide(int mode); void SetInterfaceScale(float s); void SetMenuOpen(bool open); void SetMapMode(int mode); bool LayerFound(); void SetLogger(void (*log)(const char*)); void SetLook(const FlatVRGameHudLook& look); void SetMapCorner(int corner); bool ToggleMapShown();
+namespace hud { void Register(); void SetHide(int mode); void SetEyeOffsets(float barRaise, float placeDrop); void SetInterfaceScale(float s); void SetMenuOpen(bool open); void SetMapMode(int mode); bool LayerFound(); void SetLogger(void (*log)(const char*)); void SetLook(const FlatVRGameHudLook& look); void SetMapCorner(int corner); bool ToggleMapShown();
                 void SetPointer(uint32_t mode); void SetPointerDepth(float base, float tilt, float curve, float topScale); int Anchor(int panel); void SetForearm(int panel, bool valid, const float elbow[3], const float wrist[3], const float across[3]);
                 void SetClassicView(bool on); void SetPictureZoom(float bar, float map); bool PictureWanted(); void SetPictureReady(bool ready);
                 bool PictureNow(int i, float box[4], uint64_t* srv); void SetPictureBarMoved(bool moved); void SetPictureBarOffset(float x, float y); void SetPictureMapMoved(bool moved); void SetPictureMapOffset(float x, float y);
@@ -80,7 +80,7 @@ namespace hud { void Register(); void SetHide(int mode); void SetInterfaceScale(
 namespace gamecmd { void Init(const D2RL::PluginContext* ctx); void Tick(); }   // the game's key commands from BodyWalk (gamecmd.cpp)
 namespace gamestate { bool ToggleMenus(); }
 namespace gamestate { uint32_t MenuEpoch(); }
-namespace gamestate { void Init(const D2RL::PluginContext* ctx); void Tick(); uint32_t WeaponClass(); uint32_t WeaponSet(); uint32_t WeaponType(); uint32_t HandsHeld(); uint32_t TwoHanded(); uint32_t WeaponHand(); uint32_t HandsKey(); bool MenuOpen(); int ObjectLight(uint32_t txt, uint32_t mode, float rgb[3]); uint64_t LocalPlayer(); void SetViewMode(uint32_t mode); bool AutoMapOpen(); bool SetAutoMap(bool open); void PollPlate(); bool PlateRect(int32_t out[4]); }
+namespace gamestate { void Init(const D2RL::PluginContext* ctx); void Tick(); uint32_t WeaponClass(); uint32_t WeaponSet(); uint32_t WeaponType(); uint32_t HandsHeld(); uint32_t TwoHanded(); uint32_t WeaponHand(); uint32_t HandsKey(); bool MenuOpen(); int ObjectLight(uint32_t txt, uint32_t mode, float rgb[3]); uint64_t LocalPlayer(); void SetViewMode(uint32_t mode); bool AutoMapOpen(); bool SetAutoMap(bool open); void PollPlate(); bool PlateRect(int32_t out[4]); void PollLevelName(); bool LevelNameRect(int32_t out[4]); }
 namespace gamestate {bool LeftShield();}
 #include "d2r_vr_state.h"
 
@@ -859,6 +859,8 @@ void LoadSettings() {
     g_set.mouseLook.store(IniB(L"input", L"mouse_look", false));
     g_set.hudHide.store(std::clamp((int)IniF(L"hud", L"hide", 0.0f), 0, 2));
     hud::SetHide(g_set.hudHide.load());
+    hud::SetEyeOffsets(std::clamp(IniF(L"hud", L"eye_bar_raise", 12.0f), 0.0f, 40.0f) * 0.01f,
+                       std::clamp(IniF(L"hud", L"eye_place_drop", 35.0f), 0.0f, 70.0f) * 0.01f);
     g_set.hudMap.store(std::clamp((int)IniF(L"hud", L"map", 0.0f), 0, 1));
     hud::SetMapMode(g_set.hudMap.load());
     hud::SetInterfaceScale(GameInterfaceScale());
@@ -8131,6 +8133,10 @@ DWORD WINAPI UpdateThread(void*) {
         if (g_inWorld.load() && g_set.plateAlpha.load() < 0.995f) {   // the plate's place, 10 times a second
             static ULONGLONG nextPlate = 0;
             if (nowMs >= nextPlate) { nextPlate = nowMs + 100; gamestate::PollPlate(); }
+        }
+        if (g_inWorld.load()) {
+            static ULONGLONG nextPlace = 0;
+            if (nowMs >= nextPlace) { nextPlace = nowMs + 200; gamestate::PollLevelName(); }
         }
         hud::SetLabels(LabelsWanted());
         // the fog leaves the interface alone; the floor's key never takes its text for the void

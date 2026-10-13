@@ -18,32 +18,47 @@ bool EyeCompose::Initialize(ID3D12Device* device, DXGI_FORMAT rtvFormat, void (*
     constexpr char shader[] = R"(
 Texture2D<float4> uiTex : register(t0);
 SamplerState samp : register(s0);
-cbuffer Rect : register(b0) { uint canvasW, canvasH, eyeW, eyeH, barTop, barBottom; };
+cbuffer Rect : register(b0) {
+    uint canvasW, canvasH, eyeW, eyeH, barTop, barBottom, barLift, originX;
+    uint placeX, placeY, placeW, placeH, placeDrop;
+};
 float4 VS(uint id : SV_VertexID) : SV_Position {
     return float4(id == 2 ? 3 : -1, id == 1 ? -3 : 1, 0, 1);
 }
 float3 ToLinear(float3 encoded) {
     return lerp(pow((encoded + 0.055) / 1.055, 2.4), encoded / 12.92, encoded <= 0.04045);
 }
-float4 PS(float4 position : SV_Position) : SV_Target {
-    float2 eyePx = position.xy;
-    if (!canvasW || !eyeW || barBottom <= barTop) discard;
-    float fit = float(eyeW) / float(canvasW);
-    float bandH = float(barBottom - barTop) * fit;
-    float y0 = float(eyeH) - bandH;
-    if (y0 < 0) y0 = 0;
-    if (eyePx.y < y0 || eyePx.y >= y0 + bandH) discard;
-    float srcX = eyePx.x / fit;
-    float srcY = float(barTop) + (eyePx.y - y0) / fit;
-    if (srcY < float(barTop) || srcY >= float(barBottom)) discard;
+float4 DrawAt(float srcX, float srcY) {
     uint tw, th; uiTex.GetDimensions(tw, th);
     if (srcX < 0 || srcY < 0 || srcX >= float(tw) || srcY >= float(th) || srcY >= float(canvasH)) discard;
     float4 c = uiTex.Load(int3(uint2(srcX, srcY), 0));
     float opacity = saturate(1 - c.a);
     if (opacity < 1.0 / 255.0) discard;
     float3 encoded = max(c.rgb, 0) / max(opacity, 1e-6);
-    float3 premul = ToLinear(encoded) * opacity;
-    return float4(premul, c.a);
+    return float4(ToLinear(encoded) * opacity, c.a);
+}
+float4 PS(float4 position : SV_Position) : SV_Target {
+    float2 eyePx = position.xy;
+    if (placeW && placeH) {
+        float left = float(placeX) - float(originX);
+        float top = float(placeY) + float(placeDrop);
+        if (eyePx.x >= left && eyePx.x < left + float(placeW) &&
+            eyePx.y >= top && eyePx.y < top + float(placeH))
+            return DrawAt(float(placeX) + (eyePx.x - left), float(placeY) + (eyePx.y - top));
+    }
+    if (!canvasW || !eyeW || barBottom <= barTop) discard;
+    float fit = float(eyeW) / float(canvasW);
+    float bandH = float(barBottom - barTop) * fit;
+    float lift = float(barLift);
+    float limit = float(eyeH) - bandH;
+    if (limit < 0) limit = 0;
+    if (lift > limit) lift = limit;
+    float y0 = float(eyeH) - bandH - lift;
+    if (eyePx.y < y0 || eyePx.y >= y0 + bandH) discard;
+    float srcX = eyePx.x / fit;
+    float srcY = float(barTop) + (eyePx.y - y0) / fit;
+    if (srcY < float(barTop) || srcY >= float(barBottom)) discard;
+    return DrawAt(srcX, srcY);
 }
 )";
     ComPtr<ID3DBlob> vs, ps, errors, signature;
@@ -59,7 +74,7 @@ float4 PS(float4 position : SV_Position) : SV_Target {
     parameters[0].DescriptorTable = {1, &range};
     parameters[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
     parameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-    parameters[1].Constants = {0, 0, 6};
+    parameters[1].Constants = {0, 0, 13};
     parameters[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
     D3D12_STATIC_SAMPLER_DESC sampler{};
     sampler.Filter = D3D12_FILTER_MIN_MAG_MIP_POINT;
@@ -145,8 +160,10 @@ bool EyeCompose::Render(ID3D12Device* device, ID3D12GraphicsCommandList* list, I
     ID3D12DescriptorHeap* heaps[] = {sourceHeap.Get()};
     list->SetDescriptorHeaps(1, heaps);
     list->SetGraphicsRootDescriptorTable(0, sourceHeap->GetGPUDescriptorHandleForHeapStart());
-    const uint32_t constants[6] = {rect.canvasW, rect.canvasH, rect.eyeW, rect.eyeH, rect.barTop, rect.barBottom};
-    list->SetGraphicsRoot32BitConstants(1, 6, constants, 0);
+    const uint32_t constants[13] = {
+        rect.canvasW, rect.canvasH, rect.eyeW, rect.eyeH, rect.barTop, rect.barBottom, rect.barLift, rect.originX,
+        rect.placeX, rect.placeY, rect.placeW, rect.placeH, rect.placeDrop};
+    list->SetGraphicsRoot32BitConstants(1, 13, constants, 0);
     list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     list->DrawInstanced(3, 1, 0, 0);
     return true;

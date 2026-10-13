@@ -82,6 +82,8 @@ void Log(const char* s) { if (g_log) g_log(s); }
 
 std::atomic<int> g_hide{0};   // 0 nothing, 1 the toolbar, 2 everything
 std::atomic<float> g_uiScale{1.0f};
+std::atomic<float> g_barRaise{0.12f};    // fraction of the eye height to lift the toolbar
+std::atomic<float> g_placeDrop{0.35f};   // fraction of the eye height to lower the location name
 std::atomic<bool> g_menu{false};   // the main menu, or a panel (inventory, trade...) open: nothing is hidden then   // the game's interface size, 0.5..1
 std::atomic<uint64_t> g_layer{0};   // the interface's resource, learnt from its clear
 std::atomic<int> g_mapMode{0};     // [hud] map: 0 in the picture, 1 in its own texture
@@ -165,6 +167,80 @@ rect ToolbarRect(uint32_t w, uint32_t h) {
     const float s = g_uiScale.load(), H = (float)h;
     const float bottom = H * (0.5f + 0.5f * s), top = bottom - 0.215f * H * s;   // 0.189 the bar, the wings a little above
     return Clamped(0.0f, top, (float)w, bottom + 0.004f * H, w, h);
+}
+
+// HUDLevelNames in canvas pixels. The panel is an anchor at the horizontal
+// center and 25% down the safe area (hudlevelnameshd.json). A child rect
+// huddled at that origin is local to the anchor; a rect already on the canvas
+// is screen pixels. With no child size, cover the centered title and stop
+// short of the corner map.
+bool LocationBand(uint32_t width, uint32_t height, rect& out) {
+    if (!width || !height || !gamestate::LevelNameOpen()) return false;
+    int32_t r[4]{};
+    const bool measured = gamestate::LevelNameRect(r);
+    const float s = std::clamp(g_uiScale.load(), 0.3f, 1.0f);
+    const float H = float(height), W = float(width);
+    const float anchorX = 0.5f * W;
+    const float anchorY = 0.5f * H * (1.0f - s) + 0.25f * H * s;
+    float left, top, right, bottom;
+    const char* how = "layout";
+    if (measured) {
+        const int x = r[0], y = r[1], w = r[2], h = r[3];
+        const bool local = y < int(height) / 8 && y + h < int(height) / 3 && x < int(width) / 4 && x + w < int(width) / 2;
+        if (w < 4 || h < 4 || h > int(height) / 5 || w > int(width) / 2) {
+            static int told = 0;
+            if (told < 3) {
+                ++told;
+                char b[200];
+                snprintf(b, sizeof b, "hud: location name rect %d,%d %dx%d does not fit a %ux%u layer", x, y, w, h, width, height);
+                Log(b);
+            }
+            return false;
+        }
+        if (local) {
+            left = anchorX + float(x);
+            top = anchorY + float(y);
+            how = "local";
+        } else {
+            left = float(x < 0 ? int(width) / 2 + x : x);
+            top = float(y);
+            how = "screen";
+        }
+        right = left + float(w);
+        bottom = top + float(h);
+        left -= 12.0f; top -= 12.0f; right += 12.0f; bottom += 12.0f;
+        if (top > H / 2.0f) return false;
+    } else {
+        const float mapW = 0.533f * H * s;
+        const float half = std::max(96.0f, anchorX - mapW - 48.0f);
+        left = anchorX - half;
+        right = anchorX + half;
+        top = anchorY - 0.055f * H;
+        bottom = anchorY + 0.090f * H;
+    }
+    if (bottom - top > H / 5.0f || right - left > W * 0.50f) return false;
+    out = Clamped(left, top, right, bottom, width, height);
+    if (out.right <= out.left || out.bottom <= out.top) return false;
+    static int shown = 0;
+    static const char* shownHow = "";
+    if (shown < 4 && shownHow != how) {
+        ++shown;
+        shownHow = how;
+        char b[200];
+        snprintf(b, sizeof b, "hud: location name %s %d,%d %dx%d on %ux%u", how, out.left, out.top, out.right - out.left, out.bottom - out.top, width, height);
+        Log(b);
+    }
+    return true;
+}
+
+bool LocationBandPx(uint32_t width, uint32_t height, uint32_t& x, uint32_t& y, uint32_t& w, uint32_t& h) {
+    rect name{};
+    if (!LocationBand(width, height, name)) return false;
+    x = name.left > 0 ? uint32_t(name.left) : 0;
+    y = name.top > 0 ? uint32_t(name.top) : 0;
+    w = name.right > name.left ? uint32_t(name.right - name.left) : 0;
+    h = name.bottom > name.top ? uint32_t(name.bottom - name.top) : 0;
+    return w && h;
 }
 
 // The corner map, from the safe area's top-left corner.
@@ -503,6 +579,11 @@ void OnBind(command_list* cl, uint32_t count, const resource_view* rtvs, resourc
             const rect bar = ToolbarRect(d.texture.width, d.texture.height);   // the map stays (MapRect: kept for FlatVR)
             cl->clear_render_target_view(layerRtv, kEmpty, 1, &bar);
         }
+        if (g_eyeOverlay.load() && g_overlayReady.load()) {
+            const resource_desc d = dev->get_resource_desc(dev->get_resource_from_view(layerRtv));
+            rect name{};
+            if (LocationBand(d.texture.width, d.texture.height, name)) cl->clear_render_target_view(layerRtv, kEmpty, 1, &name);
+        }
         // From above: the rest of it out whole, for the effect to lay on the tilted plane.
         const bool labels = g_labels.load() && g_picReady.load() && !g_menu.load();
         const bool mask = !labels && g_uiMask.load() && g_picReady.load() && !g_menu.load();   // copied, left in
@@ -565,6 +646,21 @@ void ToolbarBand(uint32_t height, uint32_t& top, uint32_t& bottom) {
     top = band.top > 0 ? uint32_t(band.top) : 0;
     bottom = band.bottom > int32_t(height) ? height : (band.bottom > 0 ? uint32_t(band.bottom) : 0);
     if (top > bottom) top = bottom;
+}
+void SetEyeOffsets(float barRaise, float placeDrop) {
+    g_barRaise.store(std::clamp(barRaise, 0.0f, 0.40f));
+    g_placeDrop.store(std::clamp(placeDrop, 0.0f, 0.70f));
+}
+void EyeHudPlaceFor(uint32_t canvasW, uint32_t canvasH, uint32_t eyeH, EyeHudPlace& out) {
+    out = {};
+    if (!canvasH || !eyeH) return;
+    ToolbarBand(canvasH, out.barTop, out.barBottom);
+    out.barLift = uint32_t(g_barRaise.load() * float(eyeH) + 0.5f);
+    if (!LocationBandPx(canvasW ? canvasW : canvasH, canvasH, out.placeX, out.placeY, out.placeW, out.placeH)) return;
+    uint32_t drop = uint32_t(g_placeDrop.load() * float(eyeH) + 0.5f);
+    if (out.placeH && out.placeY + drop + out.placeH > eyeH)
+        drop = eyeH > out.placeY + out.placeH ? eyeH - out.placeY - out.placeH : 0;
+    out.placeDrop = drop;
 }
 void MenuMapCapture(bool active) {g_menuMap.store(active);}
 void MapFrame() {std::lock_guard lock(g_lock);mapCaptured=false;}

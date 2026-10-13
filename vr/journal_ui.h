@@ -5,6 +5,9 @@ bool JournalOnly();
 bool OpaqueMenuOpen();
 bool JournalRect(int32_t out[4]);
 void ReadJournalRect(); // UI thread only
+void PollLevelName();
+bool LevelNameOpen();
+bool LevelNameRect(int32_t out[4]);
 }
 namespace hud {
 bool LayerFound();
@@ -22,4 +25,12 @@ void CaptureOverlay(bool on);
 uint64_t OverlayTexture(uint32_t& width,uint32_t& height);
 // Toolbar strip for one canvas height, in pixels. Same rect hide=1 clears.
 void ToolbarBand(uint32_t height, uint32_t& top, uint32_t& bottom);
+// [hud] eye_bar_raise and eye_place_drop, as fractions of the eye height.
+void SetEyeOffsets(float barRaise, float placeDrop);
+// Toolbar band plus the location-name rect, in canvas pixels. placeW is 0 until that panel is known.
+struct EyeHudPlace {
+    uint32_t barTop = 0, barBottom = 0, barLift = 0;
+    uint32_t placeX = 0, placeY = 0, placeW = 0, placeH = 0, placeDrop = 0;
+};
+void EyeHudPlaceFor(uint32_t canvasW, uint32_t canvasH, uint32_t eyeH, EyeHudPlace& out);
 }

@@ -706,6 +706,77 @@ bool PlateRect(int32_t out[4]) {
     return true;
 }
 
+// The current area name. HUDLevelNames is a zero-size panel anchored on the
+// canvas (hudlevelnameshd.json). The visible lines are its children: NameText,
+// and DesecratedText in a terror zone. Their rects are local to that panel.
+std::atomic<int32_t> g_level[4] = {};
+std::atomic<ULONGLONG> g_levelAt{0};
+std::atomic<bool> g_levelOpen{false};
+Widgets::WidgetHandle g_levelPanel = Widgets::InvalidHandle;
+void __cdecl ReadLevelName(const PluginContext* ctx, void*) noexcept {
+    if (!g_widgets || !g_widgets->findPanel || !g_widgets->getWidgetRect) return;
+    static int told = 0;
+    static Widgets::Rect last[2]{};
+    static unsigned lastFind[2] = {999u, 999u};
+    static const char* names[2] = {"NameText", "DesecratedText"};
+    Widgets::Result r = Widgets::Result::Success;
+    if (g_levelPanel == Widgets::InvalidHandle) r = g_widgets->findPanel(ctx, "HUDLevelNames", &g_levelPanel);
+    if (r == Widgets::Result::StaleHandle || r == Widgets::Result::NotFound) g_levelPanel = Widgets::InvalidHandle;
+    const bool open = r == Widgets::Result::Success && g_levelPanel != Widgets::InvalidHandle;
+    int x0 = 0, y0 = 0, x1 = 0, y1 = 0;
+    bool any = false;
+    if (open && g_widgets->findWidget) {
+        for (int i = 0; i < 2; ++i) {
+            Widgets::WidgetHandle kid = Widgets::InvalidHandle;
+            Widgets::Rect rc{};
+            Widgets::Result fr = g_widgets->findWidget(ctx, g_levelPanel, names[i], &kid);
+            Widgets::Result rr = fr;
+            if (fr == Widgets::Result::Success && kid != Widgets::InvalidHandle) rr = g_widgets->getWidgetRect(ctx, kid, &rc);
+            if (fr == Widgets::Result::StaleHandle || rr == Widgets::Result::StaleHandle) {
+                g_levelPanel = Widgets::InvalidHandle;
+                break;
+            }
+            if (told < 8 && ((unsigned)fr != lastFind[i] || rc.x != last[i].x || rc.y != last[i].y || rc.width != last[i].width || rc.height != last[i].height)) {
+                ++told;
+                lastFind[i] = (unsigned)fr;
+                last[i] = rc;
+                char b[220];
+                snprintf(b, sizeof b, "gamestate: location %s find %u rect %u at %d,%d size %dx%d",
+                         names[i], (unsigned)fr, (unsigned)rr, rc.x, rc.y, rc.width, rc.height);
+                Log(b);
+            }
+            if (rr == Widgets::Result::Success && rc.width > 0 && rc.height > 0) {
+                const int rgt = rc.x + rc.width, bot = rc.y + rc.height;
+                if (!any) { x0 = rc.x; y0 = rc.y; x1 = rgt; y1 = bot; any = true; }
+                else {
+                    if (rc.x < x0) x0 = rc.x;
+                    if (rc.y < y0) y0 = rc.y;
+                    if (rgt > x1) x1 = rgt;
+                    if (bot > y1) y1 = bot;
+                }
+            }
+        }
+    }
+    if (any && x1 > x0 && y1 > y0) {
+        g_level[0].store(x0); g_level[1].store(y0); g_level[2].store(x1 - x0); g_level[3].store(y1 - y0);
+    } else {
+        g_level[2].store(0); g_level[3].store(0);
+    }
+    g_levelOpen.store(open);
+    if (open) g_levelAt.store(GetTickCount64());
+}
+void PollLevelName() {
+    if (g_ctx && g_threads && g_threads->runOnUiThread && g_widgets) g_threads->runOnUiThread(g_ctx, &ReadLevelName, nullptr);
+}
+bool LevelNameOpen() {
+    return g_levelOpen.load() && GetTickCount64() - g_levelAt.load() <= 1000;
+}
+bool LevelNameRect(int32_t out[4]) {
+    if (!LevelNameOpen()) return false;
+    for (int i = 0; i < 4; ++i) out[i] = g_level[i].load();
+    return out[2] > 0 && out[3] > 0;
+}
+
 bool SetAutoMap(bool open) {
     if (!g_ctx || !g_threads || !g_threads->runOnUiThread || !g_widgets) return false;
     return g_threads->runOnUiThread(g_ctx, &DispatchAutoMap, open ? (void*)1 : nullptr) == Threads::Result::Success;

@@ -1779,12 +1779,14 @@ bool Copy(ID3D12Resource* src,Eye& e,reshade::api::command_queue* rq) {
         uint32_t ow=0,oh=0;
         auto* ui=reinterpret_cast<ID3D12Resource*>(hud::OverlayTexture(ow,oh));
         if(ui&&ow==canvas.width&&oh==canvas.height) {
-            uint32_t barTop=0,barBottom=0;
-            hud::ToolbarBand(canvas.height,barTop,barBottom);
-            const OverlayRect rect{canvas.width,canvas.height,width,height,barTop,barBottom};
-            static bool overlayMiss=false,overlayOn=false;
+            hud::EyeHudPlace place{};
+            hud::EyeHudPlaceFor(canvas.width,canvas.height,height,place);
+            const OverlayRect rect{canvas.width,canvas.height,width,height,place.barTop,place.barBottom,place.barLift,canvas.originX,
+                place.placeX,place.placeY,place.placeW,place.placeH,place.placeDrop};
+            static bool overlayMiss=false,overlayOn=false,placeOn=false;
             if(eyeCompose.Render(device.Get(),e.commands.Get(),ui,dest,rect)) {
-                if(!overlayOn){overlayOn=true;Say("Frame OpenXR: toolbar is head-locked on the eye");}
+                if(!overlayOn){overlayOn=true;Say("Frame OpenXR: toolbar is raised off the bottom of the eye");}
+                if(place.placeW&&!placeOn){placeOn=true;Say("Frame OpenXR: location name is lowered on the eye");}
             } else if(!overlayMiss) {
                 overlayMiss=true;
                 char message[200];
